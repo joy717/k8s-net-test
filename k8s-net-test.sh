@@ -43,8 +43,8 @@ TEST_EXTERNAL_HOST="www.baidu.com"
 TEST_EXTERNAL_IP="223.5.5.5"  # 阿里 DNS, 用于测试外部连通性
 
 # Spiderpool / Multus 相关配置
-SPIDERPOOL_DEFAULT_MULTUS="spiderpool/l2-ens12"    # Type B: spiderpool 作为默认网络
-SPIDERPOOL_ADDITIONAL_MULTUS="spiderpool/l2-ens12"  # Type C: spiderpool 作为附加网络
+SPIDERPOOL_DEFAULT_MULTUS="spiderpool/l2-ens4"    # Type B: spiderpool 作为默认网络
+SPIDERPOOL_ADDITIONAL_MULTUS="spiderpool/l2-ens4"  # Type C: spiderpool 作为附加网络
 SPIDERPOOL_SUBNET=""  # 可选: 指定 spiderpool subnet 名称
 
 KUBECONFIG_FLAG=""
@@ -189,11 +189,17 @@ exec_in_pod() {
 
 # 在 Pod 内执行命令并捕获输出 (用于失败时诊断)
 # 返回值: 命令的 exit code; 输出存到全局 LAST_OUTPUT
+#
+# 重要: 因为脚本启用了 set -euo pipefail, 命令替换 $( ... ) 中的命令失败
+# (例如 timeout / curl / ping 返回非 0) 会触发 set -e 立即终止脚本.
+# 用 "|| rc=$?" 模式吞掉非 0 退出, 才能让调用方安全地拿到 exit code.
+# 不能写成 "LAST_OUTPUT=$(...)" 然后 "local rc=$?" — 那个 $? 实际是
+# local 这个内置命令的退出码, 永远是 0.
 LAST_OUTPUT=""
 exec_in_pod_capture() {
     local pod="$1"; shift
-    LAST_OUTPUT=$(kc exec -n "$NAMESPACE" "$pod" -- timeout 10 "$@" 2>&1)
-    local rc=$?
+    local rc=0
+    LAST_OUTPUT=$(kc exec -n "$NAMESPACE" "$pod" -- timeout 10 "$@" 2>&1) || rc=$?
     return $rc
 }
 
@@ -733,8 +739,8 @@ test_pod_to_pod_multus_ping() {
 # 第 4 个参数可选: tag (lb/clusterip/nodeport/...) 用于失败标签
 test_pod_to_svc() {
     local src="$1" svc_addr="$2" desc="$3" tag="${4:-svc}"
-    exec_in_pod_capture "$src" curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 "http://${svc_addr}"
-    local rc=$?
+    local rc=0
+    exec_in_pod_capture "$src" curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 "http://${svc_addr}" || rc=$?
     if [[ $rc -eq 0 ]] && echo "$LAST_OUTPUT" | grep -q "200"; then
         record_result pass "$desc  [$src → $svc_addr]"
     else
@@ -761,8 +767,8 @@ test_pod_to_external() {
     fi
 
     # DNS 解析 + curl 外部域名
-    exec_in_pod_capture "$src" curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 "http://${TEST_EXTERNAL_HOST}"
-    local rc=$?
+    local rc=0
+    exec_in_pod_capture "$src" curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 "http://${TEST_EXTERNAL_HOST}" || rc=$?
     if [[ $rc -eq 0 ]] && echo "$LAST_OUTPUT" | grep -qE "200|301|302"; then
         record_result pass "${desc_prefix}: curl 外部域名 ($TEST_EXTERNAL_HOST)"
     else
@@ -1311,7 +1317,9 @@ EOF
 # ============================================================================
 # 打印报告 (分类汇总 + 失败详情 + 智能建议)
 # ============================================================================
+REPORT_PRINTED=false
 print_report() {
+    REPORT_PRINTED=true
     log_section "测试报告"
     echo ""
     echo -e "  ${GREEN}通过${NC}: ${PASS_COUNT} / ${TOTAL_COUNT}"
@@ -1467,8 +1475,10 @@ main() {
         log_info "跳过: $SKIP_TESTS"
     fi
 
-    # 退出时清理 tmp 文件 + namespace
+    # 退出时打印报告 + 清理 tmp 文件 + namespace
     trap '_cleanup_all' EXIT
+    # 异常退出时输出诊断信息 (有助于定位 set -e 触发位置)
+    trap 'on_unexpected_error $LINENO "$BASH_COMMAND"' ERR
 
     preflight_check
     create_resources
@@ -1492,8 +1502,38 @@ main() {
     fi
 }
 
+# 是否处于退出/清理阶段 (用来抑制清理流程里 [[ ]] 等返回 1 的命令触发 ERR)
+IN_CLEANUP=false
+
+# 异常退出时的诊断信息 (供 ERR trap 使用)
+on_unexpected_error() {
+    local exit_code=$?
+    local line_no=${1:-?}
+    local cmd="${2:-?}"
+    # 清理阶段不输出 (清理过程的 [[ ]] / kubectl delete 等可能正常返回非 0)
+    if [[ "$IN_CLEANUP" == "true" ]]; then
+        return 0
+    fi
+    echo "" >&2
+    echo -e "${RED}${BOLD}━━━ 脚本意外退出 ━━━${NC}" >&2
+    echo -e "${RED}exit_code=${exit_code}  line=${line_no}${NC}" >&2
+    echo -e "${RED}command: ${cmd}${NC}" >&2
+    echo "" >&2
+    echo -e "${YELLOW}这通常意味着某条 kubectl 命令或 pod 内命令异常退出.${NC}" >&2
+    echo -e "${YELLOW}已运行的测试结果会在下方报告中给出 (可能不完整).${NC}" >&2
+    echo "" >&2
+}
+
+# 退出时执行: 打印报告 (即使中途异常) → 清理 namespace → 删 tmp 文件
 _cleanup_all() {
     local rc=$?
+    # 标记进入清理阶段, 抑制 ERR trap; 同时关闭 set -e
+    IN_CLEANUP=true
+    set +e
+    # 先打印报告 (无论 rc 如何, 让用户看到已跑了哪些测试)
+    if [[ "${REPORT_PRINTED:-false}" != "true" && ${TOTAL_COUNT:-0} -gt 0 ]]; then
+        print_report
+    fi
     rm -f "$FAIL_TAGS_FILE" 2>/dev/null || true
     cleanup
     return $rc
