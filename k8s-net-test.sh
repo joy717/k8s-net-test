@@ -20,7 +20,15 @@
 #   chmod +x k8s-net-test.sh
 #   ./k8s-net-test.sh [--namespace <ns>] [--skip-cleanup] [--timeout <seconds>]
 #                     [--spiderpool-subnet <name>] [--spiderpool-multus <name>]
-#                     [--kubeconfig <path>]
+#                     [--kubeconfig <path>] [--verbose]
+#                     [--only <name1,name2>] [--skip <name1,name2>]
+#
+# 测试名称 (用于 --only / --skip):
+#   pod2pod, pod2svc, node2pod, external, dns, apiserver,
+#   samenode, mtu, hairpin, networkpolicy
+#
+# 排查记录 (失败时建议查看):
+#   TROUBLESHOOTING.md  — 已知问题、根因和修复方案
 
 set -euo pipefail
 
@@ -53,12 +61,35 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # ============================================================================
-# 计数器
+# 计数器 + 失败/复现记录
 # ============================================================================
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 TOTAL_COUNT=0
+
+# 按测试类目分类的计数器 (用于报告分类汇总)
+declare -A CATEGORY_PASS
+declare -A CATEGORY_FAIL
+declare -A CATEGORY_SKIP
+declare -A CATEGORY_TOTAL
+
+# 失败项详情数组: 每条形如 "category|description|reason|repro_cmd"
+FAIL_DETAILS=()
+
+# 当前正在运行的测试类目 (由 run_*_tests 设置)
+CURRENT_CATEGORY="general"
+
+# 失败类型标记 (用于智能排查建议)
+FAIL_TAGS_FILE="$(mktemp -t nettest_tags.XXXXXX)"
+: > "$FAIL_TAGS_FILE"
+
+# verbose 模式
+VERBOSE=false
+
+# 选择性运行
+ONLY_TESTS=""
+SKIP_TESTS=""
 
 # ============================================================================
 # 参数解析
@@ -71,6 +102,9 @@ while [[ $# -gt 0 ]]; do
         --spiderpool-subnet)      SPIDERPOOL_SUBNET="$2"; shift 2 ;;
         --spiderpool-multus)      SPIDERPOOL_DEFAULT_MULTUS="$2"; SPIDERPOOL_ADDITIONAL_MULTUS="$2"; shift 2 ;;
         --kubeconfig)      KUBECONFIG_FLAG="--kubeconfig $2"; shift 2 ;;
+        --verbose|-v)      VERBOSE=true; shift ;;
+        --only)            ONLY_TESTS="$2"; shift 2 ;;
+        --skip)            SKIP_TESTS="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,/^$/p' "$0" | sed 's/^#//;s/^ //'
             exit 0 ;;
@@ -101,18 +135,78 @@ log_section() {
 record_result() {
     local status="$1"
     local desc="$2"
+    local cat="${CURRENT_CATEGORY}"
     TOTAL_COUNT=$((TOTAL_COUNT + 1))
+    CATEGORY_TOTAL[$cat]=$(( ${CATEGORY_TOTAL[$cat]:-0} + 1 ))
     case "$status" in
-        pass) PASS_COUNT=$((PASS_COUNT + 1)); log_ok "$desc" ;;
-        fail) FAIL_COUNT=$((FAIL_COUNT + 1)); log_fail "$desc" ;;
-        skip) SKIP_COUNT=$((SKIP_COUNT + 1)); log_skip "$desc" ;;
+        pass) PASS_COUNT=$((PASS_COUNT + 1))
+              CATEGORY_PASS[$cat]=$(( ${CATEGORY_PASS[$cat]:-0} + 1 ))
+              log_ok "$desc" ;;
+        fail) FAIL_COUNT=$((FAIL_COUNT + 1))
+              CATEGORY_FAIL[$cat]=$(( ${CATEGORY_FAIL[$cat]:-0} + 1 ))
+              log_fail "$desc" ;;
+        skip) SKIP_COUNT=$((SKIP_COUNT + 1))
+              CATEGORY_SKIP[$cat]=$(( ${CATEGORY_SKIP[$cat]:-0} + 1 ))
+              log_skip "$desc" ;;
     esac
 }
 
-# 在 Pod 内执行命令, 带超时
+# 记录失败详情 (用于报告里集中输出 + 给出复现命令)
+# 用法: record_fail_detail "<desc>" "<reason>" "<repro_cmd>" [<tag1> [<tag2>]...]
+record_fail_detail() {
+    local desc="$1"
+    local reason="$2"
+    local repro="$3"
+    shift 3 || true
+    FAIL_DETAILS+=("${CURRENT_CATEGORY}|${desc}|${reason}|${repro}")
+    # 记录失败标签 (用于智能排查建议)
+    for tag in "$@"; do
+        echo "$tag" >> "$FAIL_TAGS_FILE"
+    done
+    # verbose 模式下立即打印 reason
+    if [[ "$VERBOSE" == "true" && -n "$reason" ]]; then
+        echo -e "         ${YELLOW}reason:${NC} $reason" | head -3
+    fi
+}
+
+# 是否应运行某个测试 (供 main 用)
+should_run_test() {
+    local name="$1"
+    if [[ -n "$ONLY_TESTS" ]]; then
+        [[ ",${ONLY_TESTS}," == *",${name},"* ]] || return 1
+    fi
+    if [[ -n "$SKIP_TESTS" ]]; then
+        [[ ",${SKIP_TESTS}," == *",${name},"* ]] && return 1
+    fi
+    return 0
+}
+
+# 在 Pod 内执行命令, 带超时, 输出原始 stdout+stderr
 exec_in_pod() {
     local pod="$1"; shift
     kc exec -n "$NAMESPACE" "$pod" -- timeout 10 "$@" 2>&1
+}
+
+# 在 Pod 内执行命令并捕获输出 (用于失败时诊断)
+# 返回值: 命令的 exit code; 输出存到全局 LAST_OUTPUT
+LAST_OUTPUT=""
+exec_in_pod_capture() {
+    local pod="$1"; shift
+    LAST_OUTPUT=$(kc exec -n "$NAMESPACE" "$pod" -- timeout 10 "$@" 2>&1)
+    local rc=$?
+    return $rc
+}
+
+# 截取输出最后 N 行 (用于报告中失败原因)
+last_lines() {
+    local n="${1:-3}"
+    echo "$LAST_OUTPUT" | tail -n "$n" | sed 's/^[[:space:]]*//' | tr '\n' ';' | sed 's/;$//'
+}
+
+# 拼装一个"可复制粘贴"的 kubectl exec 复现命令
+make_repro_cmd() {
+    local pod="$1"; shift
+    echo "kubectl exec -n $NAMESPACE $pod -- $*"
 }
 
 # 等待单个 Pod Ready
@@ -162,9 +256,16 @@ except: pass
     fi
 }
 
-# 获取节点列表
+# 获取节点列表 (优先返回可调度的 worker，再 fallback 到所有 Ready 节点)
 get_nodes() {
-    kc get nodes -o jsonpath='{.items[*].metadata.name}'
+    # 优先取 Ready 且不是 NoSchedule 的 worker
+    local schedulable
+    schedulable=$(kc get nodes -o jsonpath='{range .items[?(@.spec.unschedulable!=true)]}{.metadata.name} {end}' 2>/dev/null | tr -s ' ')
+    if [[ -n "$schedulable" ]]; then
+        echo "$schedulable" | xargs
+    else
+        kc get nodes -o jsonpath='{.items[*].metadata.name}'
+    fi
 }
 
 # 获取节点 InternalIP
@@ -568,6 +669,21 @@ EOF
 # 测试函数
 # ============================================================================
 
+# ---------- 帮助函数: 给 desc 自动追加 [same-node]/[cross-node] 标注 ----------
+# 用法: location_tag <pod-a> <pod-b>  -> 输出 "[same-node]" 或 "[cross-node]"
+location_tag() {
+    local n1 n2
+    n1=$(get_pod_node "$1" 2>/dev/null)
+    n2=$(get_pod_node "$2" 2>/dev/null)
+    if [[ -z "$n1" || -z "$n2" ]]; then
+        echo ""
+    elif [[ "$n1" == "$n2" ]]; then
+        echo "[same-node]"
+    else
+        echo "[cross-node]"
+    fi
+}
+
 # ---------- Pod → Pod (ping) ----------
 test_pod_to_pod_ping() {
     local src="$1" dst="$2" desc="$3"
@@ -577,10 +693,19 @@ test_pod_to_pod_ping() {
         record_result skip "$desc (无法获取目标 IP)"
         return
     fi
-    if exec_in_pod "$src" ping -c 2 -W 3 "$dst_ip" &>/dev/null; then
+    local loc; loc=$(location_tag "$src" "$dst")
+    desc="$desc $loc"
+    if exec_in_pod_capture "$src" ping -c 2 -W 3 "$dst_ip"; then
         record_result pass "$desc  [$src → $dst ($dst_ip)]"
     else
         record_result fail "$desc  [$src → $dst ($dst_ip)]"
+        local repro; repro=$(make_repro_cmd "$src" ping -c 2 -W 3 "$dst_ip")
+        local tags=("pod2pod")
+        [[ "$loc" == "[cross-node]" ]] && tags+=("cross-node")
+        # 检测是否是 spider→calico 跨节点 (这次踩坑的特征)
+        [[ "$src" == pod-spider* && "$dst" == pod-default* && "$loc" == "[cross-node]" ]] && tags+=("spider-to-calico-crossnode")
+        [[ "$src" == pod-default* && "$dst" == pod-spider* && "$loc" == "[cross-node]" ]] && tags+=("calico-to-spider-crossnode")
+        record_fail_detail "$desc [$src → $dst ($dst_ip)]" "$(last_lines 2)" "$repro" "${tags[@]}"
     fi
 }
 
@@ -593,20 +718,30 @@ test_pod_to_pod_multus_ping() {
         record_result skip "$desc (无法获取 Multus 附加网络 IP)"
         return
     fi
-    if exec_in_pod "$src" ping -c 2 -W 3 "$dst_ip" &>/dev/null; then
+    local loc; loc=$(location_tag "$src" "$dst")
+    desc="$desc $loc"
+    if exec_in_pod_capture "$src" ping -c 2 -W 3 "$dst_ip"; then
         record_result pass "$desc  [$src → $dst multus-ip ($dst_ip)]"
     else
         record_result fail "$desc  [$src → $dst multus-ip ($dst_ip)]"
+        local repro; repro=$(make_repro_cmd "$src" ping -c 2 -W 3 "$dst_ip")
+        record_fail_detail "$desc [$src → $dst multus-ip ($dst_ip)]" "$(last_lines 2)" "$repro" "pod2pod" "multus"
     fi
 }
 
 # ---------- Pod → Service (curl) ----------
+# 第 4 个参数可选: tag (lb/clusterip/nodeport/...) 用于失败标签
 test_pod_to_svc() {
-    local src="$1" svc_addr="$2" desc="$3"
-    if exec_in_pod "$src" curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 "http://${svc_addr}" 2>/dev/null | grep -q "200"; then
+    local src="$1" svc_addr="$2" desc="$3" tag="${4:-svc}"
+    exec_in_pod_capture "$src" curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 "http://${svc_addr}"
+    local rc=$?
+    if [[ $rc -eq 0 ]] && echo "$LAST_OUTPUT" | grep -q "200"; then
         record_result pass "$desc  [$src → $svc_addr]"
     else
         record_result fail "$desc  [$src → $svc_addr]"
+        local repro; repro=$(make_repro_cmd "$src" curl -v --connect-timeout 5 "http://${svc_addr}")
+        local reason="HTTP=${LAST_OUTPUT:-N/A}, exit=$rc"
+        record_fail_detail "$desc [$src → $svc_addr]" "$reason" "$repro" "pod2svc" "$tag"
     fi
 }
 
@@ -615,17 +750,27 @@ test_pod_to_external() {
     local src="$1" desc_prefix="$2"
 
     # ping 外部 IP
-    if exec_in_pod "$src" ping -c 2 -W 3 "$TEST_EXTERNAL_IP" &>/dev/null; then
+    if exec_in_pod_capture "$src" ping -c 2 -W 3 "$TEST_EXTERNAL_IP"; then
         record_result pass "${desc_prefix}: ping 外部 IP ($TEST_EXTERNAL_IP)"
     else
         record_result fail "${desc_prefix}: ping 外部 IP ($TEST_EXTERNAL_IP)"
+        record_fail_detail "${desc_prefix} ping 外部 IP ($TEST_EXTERNAL_IP)" \
+            "$(last_lines 2)" \
+            "$(make_repro_cmd "$src" ping -c 2 -W 3 "$TEST_EXTERNAL_IP")" \
+            "external"
     fi
 
     # DNS 解析 + curl 外部域名
-    if exec_in_pod "$src" curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 "http://${TEST_EXTERNAL_HOST}" 2>/dev/null | grep -qE "200|301|302"; then
+    exec_in_pod_capture "$src" curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 "http://${TEST_EXTERNAL_HOST}"
+    local rc=$?
+    if [[ $rc -eq 0 ]] && echo "$LAST_OUTPUT" | grep -qE "200|301|302"; then
         record_result pass "${desc_prefix}: curl 外部域名 ($TEST_EXTERNAL_HOST)"
     else
         record_result fail "${desc_prefix}: curl 外部域名 ($TEST_EXTERNAL_HOST)"
+        record_fail_detail "${desc_prefix} curl 外部域名 ($TEST_EXTERNAL_HOST)" \
+            "HTTP=${LAST_OUTPUT:-N/A}" \
+            "$(make_repro_cmd "$src" curl -v --connect-timeout 5 "http://${TEST_EXTERNAL_HOST}")" \
+            "external"
     fi
 }
 
@@ -633,17 +778,15 @@ test_pod_to_external() {
 test_pod_to_apiserver() {
     local src="$1" desc="$2"
     # 使用 ServiceAccount token 访问 /healthz
-    if exec_in_pod "$src" sh -c 'curl -sk --connect-timeout 5 -o /dev/null -w "%{http_code}" https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/healthz' 2>/dev/null | grep -q "200"; then
-        record_result pass "$desc"
+    exec_in_pod_capture "$src" sh -c 'curl -sk --connect-timeout 5 -o /dev/null -w "%{http_code}" https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/healthz'
+    local code="${LAST_OUTPUT:-000}"
+    if [[ "$code" =~ ^(200|401|403)$ ]]; then
+        record_result pass "$desc (HTTP $code, 网络可达)"
     else
-        # 也可能 403 (token 无权限), 但说明网络是通的
-        local code
-        code=$(exec_in_pod "$src" sh -c 'curl -sk --connect-timeout 5 -o /dev/null -w "%{http_code}" https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/healthz' 2>/dev/null || echo "000")
-        if [[ "$code" =~ ^(200|401|403)$ ]]; then
-            record_result pass "$desc (HTTP $code, 网络可达)"
-        else
-            record_result fail "$desc (HTTP $code)"
-        fi
+        record_result fail "$desc (HTTP $code)"
+        record_fail_detail "$desc" "HTTP=$code" \
+            "$(make_repro_cmd "$src" sh -c 'curl -vk --connect-timeout 5 https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/healthz')" \
+            "apiserver"
     fi
 }
 
@@ -652,17 +795,23 @@ test_pod_dns() {
     local src="$1" desc="$2"
 
     # 集群内 Service DNS
-    if exec_in_pod "$src" nslookup "kubernetes.default.svc.cluster.local" &>/dev/null; then
+    if exec_in_pod_capture "$src" nslookup "kubernetes.default.svc.cluster.local"; then
         record_result pass "${desc}: 集群内 DNS (kubernetes.default)"
     else
         record_result fail "${desc}: 集群内 DNS (kubernetes.default)"
+        record_fail_detail "${desc}: 集群内 DNS" "$(last_lines 2)" \
+            "$(make_repro_cmd "$src" nslookup kubernetes.default.svc.cluster.local)" \
+            "dns" "internal-dns"
     fi
 
     # 外部域名 DNS
-    if exec_in_pod "$src" nslookup "$TEST_EXTERNAL_HOST" &>/dev/null; then
+    if exec_in_pod_capture "$src" nslookup "$TEST_EXTERNAL_HOST"; then
         record_result pass "${desc}: 外部 DNS ($TEST_EXTERNAL_HOST)"
     else
         record_result fail "${desc}: 外部 DNS ($TEST_EXTERNAL_HOST)"
+        record_fail_detail "${desc}: 外部 DNS ($TEST_EXTERNAL_HOST)" "$(last_lines 2)" \
+            "$(make_repro_cmd "$src" nslookup "$TEST_EXTERNAL_HOST")" \
+            "dns" "external-dns"
     fi
 }
 
@@ -707,6 +856,10 @@ test_node_to_pod() {
             sleep 2
         done
         record_result fail "$desc  [node:$node → $pod ($pod_ip)]"
+        record_fail_detail "$desc [node:$node → $pod ($pod_ip)]" \
+            "kubectl debug node 与 hostNetwork pod 两种方式均失败" \
+            "kubectl debug node/$node --image=$IMAGE -- ping -c 2 $pod_ip" \
+            "node2pod"
         kc delete pod -n "$NAMESPACE" "$hostnet_pod" --ignore-not-found &>/dev/null || true
     fi
 }
@@ -716,6 +869,7 @@ test_node_to_pod() {
 # ============================================================================
 
 run_pod_to_pod_tests() {
+    CURRENT_CATEGORY="pod2pod"
     log_section "测试 1: Pod → Pod 连通性"
 
     local nodes
@@ -725,46 +879,48 @@ run_pod_to_pod_tests() {
 
     # --- Type A: 默认 CNI ---
     log_info "--- Type A (默认 CNI) ---"
-    test_pod_to_pod_ping "pod-default-1" "pod-default-2" \
-        "[A→A] 默认CNI Pod 间 $(if $multi_node; then echo '(跨节点)'; else echo '(同节点)'; fi)"
+    test_pod_to_pod_ping "pod-default-1" "pod-default-2" "[A→A] 默认CNI Pod 间"
 
     # --- Type B: Spiderpool 默认网络 ---
     if [[ "$SPIDERPOOL_INSTALLED" == "true" ]]; then
         log_info "--- Type B (Spiderpool 默认网络) ---"
-        test_pod_to_pod_ping "pod-spider-1" "pod-spider-2" \
-            "[B→B] Spiderpool Pod 间 $(if $multi_node; then echo '(跨节点)'; else echo '(同节点)'; fi)"
+        test_pod_to_pod_ping "pod-spider-1" "pod-spider-2" "[B→B] Spiderpool Pod 间"
     fi
 
     # --- Type C: 双网络 ---
     if [[ "$SPIDERPOOL_INSTALLED" == "true" ]]; then
         log_info "--- Type C (默认 CNI + Spiderpool 附加) ---"
-        # 通过默认网络
-        test_pod_to_pod_ping "pod-dual-1" "pod-dual-2" \
-            "[C→C] 双网络 Pod 间 - 默认网络 $(if $multi_node; then echo '(跨节点)'; else echo '(同节点)'; fi)"
-        # 通过 Multus 附加网络
-        test_pod_to_pod_multus_ping "pod-dual-1" "pod-dual-2" \
-            "[C→C] 双网络 Pod 间 - Multus 附加网络 $(if $multi_node; then echo '(跨节点)'; else echo '(同节点)'; fi)"
+        test_pod_to_pod_ping "pod-dual-1" "pod-dual-2" "[C→C] 双网络 Pod 间 - 默认网络"
+        test_pod_to_pod_multus_ping "pod-dual-1" "pod-dual-2" "[C→C] 双网络 Pod 间 - Multus 附加网络"
     fi
 
     # --- 跨 CNI 类型互通 ---
-    log_info "--- 跨 CNI 类型互通 ---"
+    # 改进: 同时覆盖同节点和跨节点。这次踩坑就是因为只测同节点掩盖了
+    #      pod-spider→pod-default 跨节点不通的问题。
+    log_info "--- 跨 CNI 类型互通 (同节点 + 跨节点) ---"
     if [[ "$SPIDERPOOL_INSTALLED" == "true" ]]; then
-        test_pod_to_pod_ping "pod-default-1" "pod-spider-1" \
-            "[A→B] 默认CNI → Spiderpool 默认网络"
-        test_pod_to_pod_ping "pod-spider-1" "pod-default-1" \
-            "[B→A] Spiderpool 默认网络 → 默认CNI"
-        test_pod_to_pod_ping "pod-default-1" "pod-dual-1" \
-            "[A→C] 默认CNI → 双网络 (默认网络)"
-        test_pod_to_pod_ping "pod-dual-1" "pod-default-1" \
-            "[C→A] 双网络 → 默认CNI"
-        test_pod_to_pod_ping "pod-spider-1" "pod-dual-1" \
-            "[B→C] Spiderpool → 双网络 (默认网络)"
-        test_pod_to_pod_ping "pod-dual-1" "pod-spider-1" \
-            "[C→B] 双网络 → Spiderpool"
+        # 同节点用例 (源/目标都是 *-1，调度在 node1)
+        test_pod_to_pod_ping "pod-default-1" "pod-spider-1" "[A→B] 默认CNI → Spiderpool"
+        test_pod_to_pod_ping "pod-spider-1" "pod-default-1" "[B→A] Spiderpool → 默认CNI"
+        test_pod_to_pod_ping "pod-default-1" "pod-dual-1"   "[A→C] 默认CNI → 双网络(默认)"
+        test_pod_to_pod_ping "pod-dual-1" "pod-default-1"   "[C→A] 双网络 → 默认CNI"
+        test_pod_to_pod_ping "pod-spider-1" "pod-dual-1"    "[B→C] Spiderpool → 双网络(默认)"
+        test_pod_to_pod_ping "pod-dual-1" "pod-spider-1"    "[C→B] 双网络 → Spiderpool"
+
+        # 跨节点用例 (仅多节点集群)
+        if $multi_node; then
+            test_pod_to_pod_ping "pod-default-1" "pod-spider-2" "[A→B] 默认CNI → Spiderpool"
+            test_pod_to_pod_ping "pod-spider-1" "pod-default-2" "[B→A] Spiderpool → 默认CNI"
+            test_pod_to_pod_ping "pod-default-1" "pod-dual-2"   "[A→C] 默认CNI → 双网络(默认)"
+            test_pod_to_pod_ping "pod-dual-1" "pod-default-2"   "[C→A] 双网络 → 默认CNI"
+            test_pod_to_pod_ping "pod-spider-1" "pod-dual-2"    "[B→C] Spiderpool → 双网络(默认)"
+            test_pod_to_pod_ping "pod-dual-1" "pod-spider-2"    "[C→B] 双网络 → Spiderpool"
+        fi
     fi
 }
 
 run_pod_to_svc_tests() {
+    CURRENT_CATEGORY="pod2svc"
     log_section "测试 2: Pod → Service 连通性"
 
     local clusterip
@@ -780,11 +936,17 @@ run_pod_to_svc_tests() {
     node_ip=$(get_node_ip "${nodes[0]}")
 
     # 定义要测试的源 Pod 列表
+    # 改进: spider/dual 同时覆盖 *-1 和 *-2 两个节点的源
+    #       (LB VIP 通常只在某个节点，单源测试可能漏掉同节点 macvlan 限制问题)
     local src_pods=("pod-default-1")
     local src_labels=("TypeA-默认CNI")
     if [[ "$SPIDERPOOL_INSTALLED" == "true" ]]; then
         src_pods+=("pod-spider-1" "pod-dual-1")
-        src_labels+=("TypeB-Spiderpool" "TypeC-双网络")
+        src_labels+=("TypeB-Spiderpool(node1)" "TypeC-双网络(node1)")
+        if [[ ${#nodes[@]} -ge 2 ]]; then
+            src_pods+=("pod-spider-2" "pod-dual-2")
+            src_labels+=("TypeB-Spiderpool(node2)" "TypeC-双网络(node2)")
+        fi
     fi
 
     for idx in "${!src_pods[@]}"; do
@@ -796,17 +958,17 @@ run_pod_to_svc_tests() {
         # ClusterIP - by IP
         if [[ -n "$clusterip" ]]; then
             test_pod_to_svc "$src" "${clusterip}:80" \
-                "[${label}] → ClusterIP ($clusterip:80)"
+                "[${label}] → ClusterIP ($clusterip:80)" "clusterip"
         fi
 
         # ClusterIP - by DNS name
         test_pod_to_svc "$src" "svc-clusterip.${NAMESPACE}.svc.cluster.local:80" \
-            "[${label}] → ClusterIP (DNS: svc-clusterip)"
+            "[${label}] → ClusterIP (DNS: svc-clusterip)" "clusterip-dns"
 
         # NodePort
         if [[ -n "$nodeport" && -n "$node_ip" ]]; then
             test_pod_to_svc "$src" "${node_ip}:${nodeport}" \
-                "[${label}] → NodePort (${node_ip}:${nodeport})"
+                "[${label}] → NodePort (${node_ip}:${nodeport})" "nodeport"
         else
             record_result skip "[${label}] → NodePort (无法获取 NodePort)"
         fi
@@ -814,7 +976,7 @@ run_pod_to_svc_tests() {
         # LoadBalancer
         if [[ -n "$lb_ip" ]]; then
             test_pod_to_svc "$src" "${lb_ip}:80" \
-                "[${label}] → LoadBalancer ($lb_ip:80)"
+                "[${label}] → LoadBalancer ($lb_ip:80)" "lb"
         else
             record_result skip "[${label}] → LoadBalancer (LB IP 未分配, 可能无 LB 控制器)"
         fi
@@ -828,13 +990,14 @@ run_pod_to_svc_tests() {
         if [[ -n "$spider_clusterip" ]]; then
             for idx in "${!src_pods[@]}"; do
                 test_pod_to_svc "${src_pods[$idx]}" "${spider_clusterip}:80" \
-                    "[${src_labels[$idx]}] → Spiderpool SVC ClusterIP ($spider_clusterip:80)"
+                    "[${src_labels[$idx]}] → Spiderpool SVC ClusterIP ($spider_clusterip:80)" "spider-clusterip"
             done
         fi
     fi
 }
 
 run_node_to_pod_tests() {
+    CURRENT_CATEGORY="node2pod"
     log_section "测试 3: Node → Pod 连通性"
 
     local nodes
@@ -866,6 +1029,7 @@ run_node_to_pod_tests() {
 }
 
 run_external_tests() {
+    CURRENT_CATEGORY="external"
     log_section "测试 4: Pod → 外部网络"
 
     test_pod_to_external "pod-default-1" "[TypeA-默认CNI]"
@@ -877,6 +1041,7 @@ run_external_tests() {
 }
 
 run_dns_tests() {
+    CURRENT_CATEGORY="dns"
     log_section "测试 5: DNS 解析"
 
     test_pod_dns "pod-default-1" "[TypeA-默认CNI]"
@@ -888,6 +1053,7 @@ run_dns_tests() {
 }
 
 run_apiserver_tests() {
+    CURRENT_CATEGORY="apiserver"
     log_section "测试 6: Pod → Kubernetes API Server"
 
     test_pod_to_apiserver "pod-default-1" "[TypeA-默认CNI] → API Server"
@@ -899,6 +1065,7 @@ run_apiserver_tests() {
 }
 
 run_same_node_cross_node_tests() {
+    CURRENT_CATEGORY="samenode"
     log_section "测试 7: 同节点 vs 跨节点对比 (TCP 连通)"
 
     local nodes
@@ -908,149 +1075,374 @@ run_same_node_cross_node_tests() {
         return
     fi
 
-    # pod-default-1 和 http-server 在同一节点 (node1)
-    log_info "--- 同节点 TCP ---"
     local server_ip
     server_ip=$(get_pod_ip "http-server")
-    if [[ -n "$server_ip" ]]; then
-        test_pod_to_svc "pod-default-1" "${server_ip}:8080" \
-            "[同节点] pod-default-1 → http-server (直连 Pod IP)"
+    if [[ -z "$server_ip" ]]; then
+        record_result skip "无法获取 http-server IP"
+        return
     fi
 
-    # pod-default-2 在 node2, http-server 在 node1
-    log_info "--- 跨节点 TCP ---"
-    if [[ -n "$server_ip" ]]; then
-        test_pod_to_svc "pod-default-2" "${server_ip}:8080" \
-            "[跨节点] pod-default-2 → http-server (直连 Pod IP)"
+    # 改进: 覆盖 Type A / B / C 三种源
+    log_info "--- 同节点 TCP (源都在 node1, http-server 也在 node1) ---"
+    test_pod_to_svc "pod-default-1" "${server_ip}:8080" \
+        "[同节点] pod-default-1 → http-server (直连 Pod IP)" "samenode-tcp"
+    if [[ "$SPIDERPOOL_INSTALLED" == "true" ]]; then
+        test_pod_to_svc "pod-spider-1" "${server_ip}:8080" \
+            "[同节点] pod-spider-1 → http-server (直连 Pod IP)" "samenode-tcp"
+        test_pod_to_svc "pod-dual-1" "${server_ip}:8080" \
+            "[同节点] pod-dual-1 → http-server (直连 Pod IP)" "samenode-tcp"
+    fi
+
+    log_info "--- 跨节点 TCP (源在 node2, http-server 在 node1) ---"
+    test_pod_to_svc "pod-default-2" "${server_ip}:8080" \
+        "[跨节点] pod-default-2 → http-server (直连 Pod IP)" "crossnode-tcp"
+    if [[ "$SPIDERPOOL_INSTALLED" == "true" ]]; then
+        test_pod_to_svc "pod-spider-2" "${server_ip}:8080" \
+            "[跨节点] pod-spider-2 → http-server (直连 Pod IP)" "crossnode-tcp"
+        test_pod_to_svc "pod-dual-2" "${server_ip}:8080" \
+            "[跨节点] pod-dual-2 → http-server (直连 Pod IP)" "crossnode-tcp"
     fi
 }
 
 run_mtu_test() {
+    CURRENT_CATEGORY="mtu"
     log_section "测试 8: MTU / 大包测试"
 
-    local pods=("pod-default-1")
-    local labels=("TypeA-默认CNI")
+    # 关键改进: 先用小包 (-s 56) 测连通性
+    #   - 小包通+大包不通 = 真 MTU 问题
+    #   - 小包就不通      = 连通性问题, MTU 测试会被误诊断
+    # 这次踩坑就是因为没做这一步，把"完全不通"误报为"MTU 过小"。
+
+    local nodes
+    read -r -a nodes <<< "$(get_nodes)"
+    local multi_node=false
+    [[ ${#nodes[@]} -ge 2 ]] && multi_node=true
+
+    # 测试矩阵: src × dst
+    #   - 同节点 default 目标 (基线)
+    #   - 跨节点 default 目标 (跨节点 overlay 路径，最常见的 MTU 限制场景)
+    #   - 跨节点 spider 目标 (underlay 路径，与 overlay 不同)
+    declare -a srcs srcs_labels
+    srcs=("pod-default-1");      srcs_labels=("TypeA-默认CNI")
     if [[ "$SPIDERPOOL_INSTALLED" == "true" ]]; then
-        pods+=("pod-spider-1" "pod-dual-1")
-        labels+=("TypeB-Spiderpool" "TypeC-双网络")
+        srcs+=("pod-spider-1" "pod-dual-1")
+        srcs_labels+=("TypeB-Spiderpool" "TypeC-双网络")
     fi
 
-    local dst_ip
-    dst_ip=$(get_pod_ip "pod-default-2")
-    if [[ -z "$dst_ip" ]]; then
-        record_result skip "MTU 测试: 无法获取目标 Pod IP"
-        return
+    declare -a dsts dsts_labels
+    # 默认网络目标 - 跨节点 (主要场景)
+    if $multi_node; then
+        dsts+=("pod-default-2");   dsts_labels+=("→ default-2 (cross-node)")
+    else
+        dsts+=("pod-default-2");   dsts_labels+=("→ default-2 (same-node)")
+    fi
+    # Spiderpool 目标 - 跨节点 (验证 underlay MTU)
+    if [[ "$SPIDERPOOL_INSTALLED" == "true" ]] && $multi_node; then
+        dsts+=("pod-spider-2");    dsts_labels+=("→ spider-2 (cross-node)")
     fi
 
-    for idx in "${!pods[@]}"; do
-        local src="${pods[$idx]}"
-        local label="${labels[$idx]}"
+    for sidx in "${!srcs[@]}"; do
+        local src="${srcs[$sidx]}" slabel="${srcs_labels[$sidx]}"
+        for didx in "${!dsts[@]}"; do
+            local dst="${dsts[$didx]}" dlabel="${dsts_labels[$didx]}"
+            local dst_ip; dst_ip=$(get_pod_ip "$dst")
+            if [[ -z "$dst_ip" ]]; then
+                record_result skip "[${slabel}] MTU ${dlabel}: 无法获取目标 IP"
+                continue
+            fi
 
-        # 1400 字节 (通常安全)
-        if exec_in_pod "$src" ping -c 2 -W 5 -M do -s 1400 "$dst_ip" &>/dev/null; then
-            record_result pass "[${label}] MTU 测试: 1400 字节 ping 成功"
-        else
-            record_result fail "[${label}] MTU 测试: 1400 字节 ping 失败 (MTU 可能过小)"
-        fi
+            local prefix="[${slabel}] MTU ${dlabel}"
 
-        # 探测实际 MTU
-        local mtu_val=""
-        for size in 1500 1450 1400 1350 1300 1200; do
-            if exec_in_pod "$src" ping -c 1 -W 3 -M do -s "$size" "$dst_ip" &>/dev/null; then
-                mtu_val=$((size + 28))  # ICMP header = 8, IP header = 20
-                break
+            # ---------- 步骤 1: 小包连通性 ----------
+            if ! exec_in_pod_capture "$src" ping -c 2 -W 3 "$dst_ip"; then
+                # 小包就不通，标记为连通性失败 (不是 MTU 问题)
+                record_result fail "${prefix}: 小包连通性失败 (非 MTU 问题，请先排查连通性)"
+                local repro; repro=$(make_repro_cmd "$src" ping -c 2 "$dst_ip")
+                local tags=("mtu" "connectivity-failure")
+                # 这次踩坑特征
+                [[ "$src" == pod-spider* && "$dst" == pod-default* ]] && tags+=("spider-to-calico-crossnode")
+                [[ "$src" == pod-default* && "$dst" == pod-spider* ]] && tags+=("calico-to-spider-crossnode")
+                record_fail_detail "${prefix}: 小包连通性失败" "$(last_lines 2)" "$repro" "${tags[@]}"
+                continue
+            fi
+
+            # ---------- 步骤 2: 1400 字节 DF ping ----------
+            if exec_in_pod_capture "$src" ping -c 2 -W 5 -M do -s 1400 "$dst_ip"; then
+                record_result pass "${prefix}: 1400 字节 DF ping 成功"
+            else
+                record_result fail "${prefix}: 1400 字节 DF ping 失败 (真 MTU 问题: 小包通,大包不通)"
+                record_fail_detail "${prefix}: 1400 DF ping 失败" "$(last_lines 2)" \
+                    "$(make_repro_cmd "$src" ping -M do -s 1400 "$dst_ip")" \
+                    "mtu" "real-mtu-issue"
+            fi
+
+            # ---------- 步骤 3: 探测实际 MTU ----------
+            local mtu_val=""
+            for size in 1472 1450 1400 1350 1300 1200 1000; do
+                if exec_in_pod "$src" ping -c 1 -W 3 -M do -s "$size" "$dst_ip" &>/dev/null; then
+                    mtu_val=$((size + 28))  # ICMP=8 + IP=20
+                    break
+                fi
+            done
+            if [[ -n "$mtu_val" ]]; then
+                log_info "  ${prefix}: 探测 MTU ≥ ${mtu_val} bytes"
+            else
+                log_warn "  ${prefix}: 探测 MTU 失败 (理论上不应到这里，因为小包是通的)"
             fi
         done
-        if [[ -n "$mtu_val" ]]; then
-            log_info "  [${label}] 探测 MTU ≥ ${mtu_val} bytes"
-        else
-            log_warn "  [${label}] 无法探测 MTU (所有大小均失败)"
-        fi
     done
 }
 
 run_hairpin_test() {
+    CURRENT_CATEGORY="hairpin"
     log_section "测试 9: Hairpin / 自身访问测试"
 
     # Pod 通过 Service 访问自身 (hairpin NAT)
     log_info "--- Pod 通过 ClusterIP Service 访问自身 ---"
     test_pod_to_svc "http-server" "svc-clusterip.${NAMESPACE}.svc.cluster.local:80" \
-        "[Hairpin] http-server → 自身 ClusterIP Service"
+        "[Hairpin] http-server → 自身 ClusterIP Service" "hairpin"
 }
 
 run_network_policy_test() {
+    CURRENT_CATEGORY="networkpolicy"
     log_section "测试 10: NetworkPolicy 验证 (可选)"
 
-    # 创建一个 NetworkPolicy 拒绝所有入站
-    log_info "创建 deny-all NetworkPolicy..."
-    kc apply -n "$NAMESPACE" -f - <<EOF
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: deny-all-to-isolated
-spec:
-  podSelector:
-    matchLabels:
-      instance: pod-default-2
-  policyTypes:
-  - Ingress
-  ingress: []   # 拒绝所有入站
-EOF
+    # ---------- Type A (默认 CNI) NetworkPolicy ----------
+    _np_test_target "pod-default-2" "pod-default-1" "TypeA-默认CNI"
 
-    sleep 3  # 等待策略生效
-
-    local dst_ip
-    dst_ip=$(get_pod_ip "pod-default-2")
-    if [[ -z "$dst_ip" ]]; then
-        record_result skip "NetworkPolicy 测试: 无法获取目标 IP"
-        kc delete networkpolicy -n "$NAMESPACE" deny-all-to-isolated --ignore-not-found &>/dev/null
-        return
-    fi
-
-    # 预期: ping 应该失败
-    if ! exec_in_pod "pod-default-1" ping -c 2 -W 3 "$dst_ip" &>/dev/null; then
-        record_result pass "[NetworkPolicy] deny-all 策略生效: ping 被拒绝"
-    else
-        record_result fail "[NetworkPolicy] deny-all 策略未生效: ping 仍然成功 (CNI 可能不支持 NetworkPolicy)"
-    fi
-
-    # 清理 NetworkPolicy
-    kc delete networkpolicy -n "$NAMESPACE" deny-all-to-isolated --ignore-not-found &>/dev/null
-
-    sleep 3  # 等待策略删除生效
-
-    # 验证删除后恢复
-    if exec_in_pod "pod-default-1" ping -c 2 -W 3 "$dst_ip" &>/dev/null; then
-        record_result pass "[NetworkPolicy] 策略删除后恢复: ping 成功"
-    else
-        record_result fail "[NetworkPolicy] 策略删除后未恢复: ping 仍然失败"
+    # ---------- Type B (Spiderpool macvlan) NetworkPolicy ----------
+    # 改进: macvlan 直连模式 NetworkPolicy 通常不生效, 这是已知行为
+    #       这里用 WARN 模式验证, 不算 FAIL.
+    if [[ "$SPIDERPOOL_INSTALLED" == "true" ]]; then
+        _np_test_target_warn "pod-spider-2" "pod-spider-1" "TypeB-Spiderpool"
     fi
 }
 
+# 辅助: 严格模式测试 NetworkPolicy (CNI 必须支持，否则 FAIL)
+_np_test_target() {
+    local target="$1" src="$2" label="$3"
+
+    log_info "--- ${label}: NetworkPolicy on ${target} ---"
+    kc apply -n "$NAMESPACE" -f - <<EOF >/dev/null
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-${target}
+spec:
+  podSelector:
+    matchLabels:
+      instance: ${target}
+  policyTypes:
+  - Ingress
+  ingress: []
+EOF
+    sleep 3
+
+    local dst_ip; dst_ip=$(get_pod_ip "$target")
+    if [[ -z "$dst_ip" ]]; then
+        record_result skip "[${label}] NetworkPolicy: 无法获取目标 IP"
+        kc delete networkpolicy -n "$NAMESPACE" "deny-all-${target}" --ignore-not-found &>/dev/null
+        return
+    fi
+
+    if ! exec_in_pod "$src" ping -c 2 -W 3 "$dst_ip" &>/dev/null; then
+        record_result pass "[${label}] NetworkPolicy deny-all 生效: ping 被拒绝"
+    else
+        record_result fail "[${label}] NetworkPolicy deny-all 未生效: ping 仍成功 (CNI 可能不支持)"
+        record_fail_detail "[${label}] NetworkPolicy 未生效" \
+            "ping 应被拒绝但成功了" \
+            "kubectl get networkpolicy -n $NAMESPACE; $(make_repro_cmd "$src" ping -c 2 "$dst_ip")" \
+            "networkpolicy"
+    fi
+
+    kc delete networkpolicy -n "$NAMESPACE" "deny-all-${target}" --ignore-not-found &>/dev/null
+    sleep 3
+
+    if exec_in_pod "$src" ping -c 2 -W 3 "$dst_ip" &>/dev/null; then
+        record_result pass "[${label}] NetworkPolicy 删除后恢复: ping 成功"
+    else
+        record_result fail "[${label}] NetworkPolicy 删除后未恢复: ping 仍失败"
+        record_fail_detail "[${label}] NetworkPolicy 删除后未恢复" \
+            "策略已删除但 ping 仍不通" \
+            "$(make_repro_cmd "$src" ping -c 2 "$dst_ip")" \
+            "networkpolicy"
+    fi
+}
+
+# 辅助: 宽松模式 (用于 Spiderpool macvlan, 不生效是预期行为)
+_np_test_target_warn() {
+    local target="$1" src="$2" label="$3"
+
+    log_info "--- ${label}: NetworkPolicy on ${target} (Spiderpool 通常不生效, WARN 模式) ---"
+    kc apply -n "$NAMESPACE" -f - <<EOF >/dev/null
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-${target}
+spec:
+  podSelector:
+    matchLabels:
+      instance: ${target}
+  policyTypes:
+  - Ingress
+  ingress: []
+EOF
+    sleep 3
+
+    local dst_ip; dst_ip=$(get_pod_ip "$target")
+    if [[ -z "$dst_ip" ]]; then
+        record_result skip "[${label}] NetworkPolicy: 无法获取目标 IP"
+        kc delete networkpolicy -n "$NAMESPACE" "deny-all-${target}" --ignore-not-found &>/dev/null
+        return
+    fi
+
+    if ! exec_in_pod "$src" ping -c 2 -W 3 "$dst_ip" &>/dev/null; then
+        record_result pass "[${label}] NetworkPolicy 对 macvlan 生效: ping 被拒绝 (CNI 支持)"
+    else
+        # macvlan 模式下 NetworkPolicy 通常不生效, 不算 FAIL
+        record_result skip "[${label}] NetworkPolicy 对 macvlan 不生效: ping 仍成功 (已知限制, 非问题)"
+        log_warn "  Spiderpool macvlan 模式下 NetworkPolicy 通常不生效 (流量绕过 host 协议栈)"
+    fi
+
+    kc delete networkpolicy -n "$NAMESPACE" "deny-all-${target}" --ignore-not-found &>/dev/null
+    sleep 2
+}
+
 # ============================================================================
-# 打印报告
+# 打印报告 (分类汇总 + 失败详情 + 智能建议)
 # ============================================================================
 print_report() {
     log_section "测试报告"
     echo ""
-    echo -e "  ${GREEN}通过${NC}: ${PASS_COUNT}"
+    echo -e "  ${GREEN}通过${NC}: ${PASS_COUNT} / ${TOTAL_COUNT}"
     echo -e "  ${RED}失败${NC}: ${FAIL_COUNT}"
     echo -e "  ${CYAN}跳过${NC}: ${SKIP_COUNT}"
-    echo -e "  ${BOLD}总计${NC}: ${TOTAL_COUNT}"
     echo ""
 
-    if [[ $FAIL_COUNT -gt 0 ]]; then
-        echo -e "${RED}${BOLD}⚠ 存在失败的测试项, 请检查上方日志获取详情${NC}"
+    # ---------- 按测试类目分类汇总 ----------
+    echo -e "${BOLD}按类目:${NC}"
+    local categories=(pod2pod pod2svc node2pod external dns apiserver samenode mtu hairpin networkpolicy)
+    local labels=(
+        "Pod→Pod"  "Pod→SVC"  "Node→Pod" "External"  "DNS"
+        "APIServer" "Same/Cross" "MTU"  "Hairpin" "NetworkPolicy"
+    )
+    for i in "${!categories[@]}"; do
+        local c="${categories[$i]}" l="${labels[$i]}"
+        local p="${CATEGORY_PASS[$c]:-0}"
+        local f="${CATEGORY_FAIL[$c]:-0}"
+        local s="${CATEGORY_SKIP[$c]:-0}"
+        local t="${CATEGORY_TOTAL[$c]:-0}"
+        [[ "$t" == "0" ]] && continue
+        local marker="${GREEN}✓${NC}"
+        [[ "$f" -gt 0 ]] && marker="${RED}✗${NC}"
+        printf "  %s  %-15s  %s/%s  pass" "$(printf "%b" "$marker")" "$l" "$p" "$t"
+        [[ "$f" -gt 0 ]] && printf "  ${RED}%s fail${NC}" "$f"
+        [[ "$s" -gt 0 ]] && printf "  ${CYAN}%s skip${NC}" "$s"
+        printf "\n"
+    done
+    echo ""
+
+    # ---------- 失败项详情 ----------
+    if [[ ${#FAIL_DETAILS[@]} -gt 0 ]]; then
+        echo -e "${RED}${BOLD}失败项详情:${NC}"
         echo ""
-        echo "排查建议:"
-        echo "  1. 检查 Pod 网络配置: kubectl get pods -n $NAMESPACE -o wide"
-        echo "  2. 检查 Pod 日志/事件: kubectl describe pod <pod-name> -n $NAMESPACE"
-        echo "  3. 检查 CNI 日志: journalctl -u kubelet | grep cni"
-        echo "  4. 检查 Spiderpool 状态: kubectl get spiderippool -A"
-        echo "  5. 检查 kube-proxy / iptables: iptables -t nat -L -n | grep <svc-clusterip>"
+        local i=1
+        for entry in "${FAIL_DETAILS[@]}"; do
+            local cat="${entry%%|*}"; entry="${entry#*|}"
+            local desc="${entry%%|*}"; entry="${entry#*|}"
+            local reason="${entry%%|*}"; entry="${entry#*|}"
+            local repro="${entry}"
+            printf "  ${BOLD}%d.${NC} [${RED}%s${NC}] %s\n" "$i" "$cat" "$desc"
+            [[ -n "$reason" ]] && printf "       ${YELLOW}reason:${NC} %s\n" "$reason"
+            [[ -n "$repro"  ]] && printf "       ${BLUE}repro:${NC}  %s\n" "$repro"
+            echo ""
+            i=$((i+1))
+        done
+    fi
+
+    # ---------- 智能排查建议 ----------
+    if [[ $FAIL_COUNT -gt 0 ]]; then
+        _print_smart_suggestions
     else
         echo -e "${GREEN}${BOLD}✅ 所有测试通过!${NC}"
     fi
+    echo ""
+}
+
+# 根据失败标签输出有针对性的排查建议
+_print_smart_suggestions() {
+    echo -e "${YELLOW}${BOLD}排查建议:${NC}"
+    echo ""
+
+    # 通用建议
+    echo "  通用排查:"
+    echo "    kubectl get pods -n $NAMESPACE -o wide"
+    echo "    kubectl describe pod <pod> -n $NAMESPACE"
+    echo ""
+
+    local tags=""
+    [[ -s "$FAIL_TAGS_FILE" ]] && tags=$(sort -u "$FAIL_TAGS_FILE")
+
+    # 这次踩坑场景: spider→calico 跨节点不通
+    if echo "$tags" | grep -q "spider-to-calico-crossnode"; then
+        echo -e "  ${BOLD}⚠ 检测到 Spiderpool → Calico 跨节点失败${NC}"
+        echo "    可能原因: macvlan + Calico 不对称路径 (这次踩坑的典型问题)"
+        echo "    解决方案: 在每个节点添加 SNAT 规则:"
+        echo "      iptables -t nat -I POSTROUTING 1 \\"
+        echo "        -s <SPIDER_CIDR> -d <CALICO_CIDR> -j MASQUERADE \\"
+        echo "        -m comment --comment 'spiderpool-to-calico-snat'"
+        echo "    详见: TROUBLESHOOTING.md 问题 2"
+        echo ""
+    fi
+
+    # LB 测试失败
+    if echo "$tags" | grep -q "^lb$"; then
+        echo -e "  ${BOLD}⚠ 检测到 LoadBalancer 访问失败${NC}"
+        echo "    可能原因 1: MetalLB 未给 svc-lb 分配 IP"
+        echo "      kubectl get svc -n $NAMESPACE svc-lb"
+        echo "    可能原因 2: macvlan pod 访问本节点 LB VIP (macvlan 父子接口限制)"
+        echo "      把 LB VIP 加入 SpiderCoordinator hijackCIDR:"
+        echo "        kubectl edit spidercoordinator default"
+        echo "    详见: TROUBLESHOOTING.md 问题 1"
+        echo ""
+    fi
+
+    # 真 MTU 问题
+    if echo "$tags" | grep -q "real-mtu-issue"; then
+        echo -e "  ${BOLD}⚠ 检测到真正的 MTU 问题 (小包通,大包不通)${NC}"
+        echo "    可能原因: pod MTU 配置 > 实际链路 MTU (常见于 VXLAN/IPIP 隧道)"
+        echo "    检查方法:"
+        echo "      ip link show | grep mtu              # 各接口 MTU"
+        echo "      kubectl get felixconfiguration -o yaml | grep -i mtu"
+        echo ""
+    fi
+
+    # MTU 测试中的连通性失败 (而非真 MTU 问题)
+    if echo "$tags" | grep -q "connectivity-failure"; then
+        echo -e "  ${BOLD}ℹ MTU 测试中检测到连通性失败 (不是 MTU 问题)${NC}"
+        echo "    脚本已自动区分: 小包不通时不会误诊为 MTU"
+        echo "    请优先排查 Pod→Pod 测试的失败项"
+        echo ""
+    fi
+
+    # NetworkPolicy 不生效
+    if echo "$tags" | grep -q "networkpolicy"; then
+        echo -e "  ${BOLD}⚠ 检测到 NetworkPolicy 异常${NC}"
+        echo "    检查 CNI 是否支持 NetworkPolicy (Calico/Cilium 支持，flannel 不支持)"
+        echo "    检查 Felix 配置: kubectl get felixconfiguration default -o yaml"
+        echo ""
+    fi
+
+    # DNS 失败
+    if echo "$tags" | grep -q "internal-dns\|external-dns\|^dns$"; then
+        echo -e "  ${BOLD}⚠ DNS 解析失败${NC}"
+        echo "    kubectl get pods -n kube-system | grep -iE 'dns|coredns'"
+        echo "    kubectl logs -n kube-system -l k8s-app=kube-dns --tail=50"
+        echo ""
+    fi
+
+    # 通用收尾
+    echo "  完整排查文档: TROUBLESHOOTING.md (含真实案例、抓包技巧、修复脚本)"
     echo ""
 }
 
@@ -1065,27 +1457,46 @@ main() {
     echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
-    trap cleanup EXIT
+    if [[ "$VERBOSE" == "true" ]]; then
+        log_info "verbose 模式已启用"
+    fi
+    if [[ -n "$ONLY_TESTS" ]]; then
+        log_info "仅运行: $ONLY_TESTS"
+    fi
+    if [[ -n "$SKIP_TESTS" ]]; then
+        log_info "跳过: $SKIP_TESTS"
+    fi
+
+    # 退出时清理 tmp 文件 + namespace
+    trap '_cleanup_all' EXIT
 
     preflight_check
     create_resources
 
-    run_pod_to_pod_tests
-    run_pod_to_svc_tests
-    run_node_to_pod_tests
-    run_external_tests
-    run_dns_tests
-    run_apiserver_tests
-    run_same_node_cross_node_tests
-    run_mtu_test
-    run_hairpin_test
-    run_network_policy_test
+    # 注: 测试名跟 --only/--skip 的 token 一一对应
+    should_run_test pod2pod         && run_pod_to_pod_tests
+    should_run_test pod2svc         && run_pod_to_svc_tests
+    should_run_test node2pod        && run_node_to_pod_tests
+    should_run_test external        && run_external_tests
+    should_run_test dns             && run_dns_tests
+    should_run_test apiserver       && run_apiserver_tests
+    should_run_test samenode        && run_same_node_cross_node_tests
+    should_run_test mtu             && run_mtu_test
+    should_run_test hairpin         && run_hairpin_test
+    should_run_test networkpolicy   && run_network_policy_test
 
     print_report
 
     if [[ $FAIL_COUNT -gt 0 ]]; then
         exit 1
     fi
+}
+
+_cleanup_all() {
+    local rc=$?
+    rm -f "$FAIL_TAGS_FILE" 2>/dev/null || true
+    cleanup
+    return $rc
 }
 
 main "$@"
