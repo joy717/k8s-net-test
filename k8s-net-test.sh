@@ -20,7 +20,7 @@
 #   chmod +x k8s-net-test.sh
 #   ./k8s-net-test.sh [--namespace <ns>] [--skip-cleanup] [--timeout <seconds>]
 #                     [--spiderpool-subnet <name>] [--spiderpool-multus <name>]
-#                     [--kubeconfig <path>] [--verbose]
+#                     [--kubeconfig <path>] [--verbose] [--skip-lb]
 #                     [--only <name1,name2>] [--skip <name1,name2>]
 #
 # 测试名称 (用于 --only / --skip):
@@ -47,7 +47,11 @@ SPIDERPOOL_DEFAULT_MULTUS="spiderpool/l2-ens4"    # Type B: spiderpool 作为默
 SPIDERPOOL_ADDITIONAL_MULTUS="spiderpool/l2-ens4"  # Type C: spiderpool 作为附加网络
 SPIDERPOOL_SUBNET=""  # 可选: 指定 spiderpool subnet 名称
 
-KUBECONFIG_FLAG=""
+KUBECONFIG_ARGS=()
+KUBECONFIG_PATH=""
+
+# 仅删除本脚本实际创建的 namespace，避免 --namespace 指向已有 namespace 时误删
+CREATED_NAMESPACE=false
 
 # ============================================================================
 # 颜色输出
@@ -81,8 +85,7 @@ FAIL_DETAILS=()
 CURRENT_CATEGORY="general"
 
 # 失败类型标记 (用于智能排查建议)
-FAIL_TAGS_FILE="$(mktemp -t nettest_tags.XXXXXX)"
-: > "$FAIL_TAGS_FILE"
+FAIL_TAGS_FILE=""
 
 # verbose 模式
 VERBOSE=false
@@ -90,23 +93,70 @@ VERBOSE=false
 # 选择性运行
 ONLY_TESTS=""
 SKIP_TESTS=""
+SKIP_LB=false
+
+VALID_TESTS=(pod2pod pod2svc node2pod external dns apiserver samenode mtu hairpin networkpolicy)
+
+usage() {
+    sed -n '2,/^$/p' "$0" | sed 's/^#//;s/^ //'
+}
+
+die() {
+    echo "错误: $*" >&2
+    exit 2
+}
+
+require_arg() {
+    local opt="$1"
+    local value="${2:-}"
+    [[ -n "$value" && "$value" != --* ]] || die "$opt 需要一个参数"
+}
+
+validate_positive_int() {
+    local value="$1"
+    local opt="$2"
+    [[ "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]] || die "$opt 必须是正整数"
+}
+
+is_valid_test_name() {
+    local name="$1"
+    local valid
+    for valid in "${VALID_TESTS[@]}"; do
+        [[ "$name" == "$valid" ]] && return 0
+    done
+    return 1
+}
+
+validate_test_list() {
+    local opt="$1"
+    local list="$2"
+    local name
+    local -a _test_names
+    [[ -n "$list" ]] || die "$opt 不能为空"
+    IFS=',' read -r -a _test_names <<< "$list"
+    for name in "${_test_names[@]}"; do
+        [[ -n "$name" ]] || die "$opt 包含空测试名: $list"
+        is_valid_test_name "$name" || die "$opt 包含未知测试名: $name (可选: ${VALID_TESTS[*]})"
+    done
+}
 
 # ============================================================================
 # 参数解析
 # ============================================================================
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --namespace)       NAMESPACE="$2"; shift 2 ;;
+        --namespace)       require_arg "$1" "${2:-}"; NAMESPACE="$2"; shift 2 ;;
         --skip-cleanup)    SKIP_CLEANUP=true; shift ;;
-        --timeout)         TIMEOUT="$2"; shift 2 ;;
-        --spiderpool-subnet)      SPIDERPOOL_SUBNET="$2"; shift 2 ;;
-        --spiderpool-multus)      SPIDERPOOL_DEFAULT_MULTUS="$2"; SPIDERPOOL_ADDITIONAL_MULTUS="$2"; shift 2 ;;
-        --kubeconfig)      KUBECONFIG_FLAG="--kubeconfig $2"; shift 2 ;;
+        --timeout)         require_arg "$1" "${2:-}"; validate_positive_int "$2" "$1"; TIMEOUT="$2"; shift 2 ;;
+        --spiderpool-subnet)      require_arg "$1" "${2:-}"; SPIDERPOOL_SUBNET="$2"; shift 2 ;;
+        --spiderpool-multus)      require_arg "$1" "${2:-}"; SPIDERPOOL_DEFAULT_MULTUS="$2"; SPIDERPOOL_ADDITIONAL_MULTUS="$2"; shift 2 ;;
+        --kubeconfig)      require_arg "$1" "${2:-}"; KUBECONFIG_PATH="$2"; KUBECONFIG_ARGS=(--kubeconfig "$2"); shift 2 ;;
         --verbose|-v)      VERBOSE=true; shift ;;
-        --only)            ONLY_TESTS="$2"; shift 2 ;;
-        --skip)            SKIP_TESTS="$2"; shift 2 ;;
+        --skip-lb)         SKIP_LB=true; shift ;;
+        --only)            require_arg "$1" "${2:-}"; validate_test_list "$1" "$2"; ONLY_TESTS="$2"; shift 2 ;;
+        --skip)            require_arg "$1" "${2:-}"; validate_test_list "$1" "$2"; SKIP_TESTS="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,/^$/p' "$0" | sed 's/^#//;s/^ //'
+            usage
             exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -116,8 +166,7 @@ done
 # 工具函数
 # ============================================================================
 kc() {
-    # shellcheck disable=SC2086
-    kubectl $KUBECONFIG_FLAG "$@"
+    kubectl "${KUBECONFIG_ARGS[@]}" "$@"
 }
 
 log_info()  { echo -e "${BLUE}[INFO]${NC}  $*"; }
@@ -209,10 +258,27 @@ last_lines() {
     echo "$LAST_OUTPUT" | tail -n "$n" | sed 's/^[[:space:]]*//' | tr '\n' ';' | sed 's/;$//'
 }
 
+shell_join() {
+    local out="" arg quoted
+    for arg in "$@"; do
+        printf -v quoted '%q' "$arg"
+        out+="${out:+ }${quoted}"
+    done
+    echo "$out"
+}
+
+kubectl_repro_cmd() {
+    if [[ -n "$KUBECONFIG_PATH" ]]; then
+        shell_join kubectl --kubeconfig "$KUBECONFIG_PATH" "$@"
+    else
+        shell_join kubectl "$@"
+    fi
+}
+
 # 拼装一个"可复制粘贴"的 kubectl exec 复现命令
 make_repro_cmd() {
     local pod="$1"; shift
-    echo "kubectl exec -n $NAMESPACE $pod -- $*"
+    kubectl_repro_cmd exec -n "$NAMESPACE" "$pod" -- "$@"
 }
 
 # 等待单个 Pod Ready
@@ -279,9 +345,48 @@ get_node_ip() {
     kc get node "$1" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'
 }
 
+get_service_lb_addr() {
+    local svc="$1"
+    local ip hostname
+    ip=$(kc get svc -n "$NAMESPACE" "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+    if [[ -n "$ip" ]]; then
+        echo "$ip"
+        return 0
+    fi
+    hostname=$(kc get svc -n "$NAMESPACE" "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+    [[ -n "$hostname" ]] && echo "$hostname"
+}
+
 # 获取 Pod 所在节点
 get_pod_node() {
     kc get pod -n "$NAMESPACE" "$1" -o jsonpath='{.spec.nodeName}'
+}
+
+# 校验 Multus NAD 引用。由于测试 namespace 是临时创建的，Spiderpool NAD 必须写成 namespace/name。
+validate_nad_ref() {
+    local ref="$1"
+    local purpose="$2"
+    local nad_ns nad_name
+
+    if [[ "$ref" != */* ]]; then
+        log_warn "Spiderpool ${purpose} NAD '$ref' 未包含 namespace；临时 namespace 中无法预先找到该 NAD"
+        log_warn "请使用 namespace/name 格式，例如 spiderpool/l2-ens4"
+        return 1
+    fi
+
+    nad_ns="${ref%%/*}"
+    nad_name="${ref#*/}"
+    if [[ -z "$nad_ns" || -z "$nad_name" || "$nad_name" == */* ]]; then
+        log_warn "Spiderpool ${purpose} NAD 引用格式无效: $ref"
+        return 1
+    fi
+
+    if ! kc get network-attachment-definitions.k8s.cni.cncf.io -n "$nad_ns" "$nad_name" &>/dev/null; then
+        log_warn "未找到 Spiderpool ${purpose} NAD: $ref"
+        return 1
+    fi
+    log_info "Spiderpool ${purpose} NAD: $ref"
+    return 0
 }
 
 # ============================================================================
@@ -290,7 +395,15 @@ get_pod_node() {
 cleanup() {
     if [[ "$SKIP_CLEANUP" == "true" ]]; then
         log_warn "跳过清理。资源保留在 namespace: $NAMESPACE"
-        log_warn "手动清理: kubectl delete namespace $NAMESPACE"
+        if [[ "$CREATED_NAMESPACE" == "true" ]]; then
+            log_warn "手动清理: $(kubectl_repro_cmd delete namespace "$NAMESPACE")"
+        else
+            log_warn "Namespace $NAMESPACE 不是本脚本创建的，不会自动删除"
+        fi
+        return
+    fi
+    if [[ "$CREATED_NAMESPACE" != "true" ]]; then
+        log_info "Namespace $NAMESPACE 不是本脚本创建的，跳过删除"
         return
     fi
     log_section "清理测试资源"
@@ -345,9 +458,23 @@ preflight_check() {
         fi
     fi
 
+    if [[ "$SPIDERPOOL_INSTALLED" == "true" ]]; then
+        local nad_ok=true
+        validate_nad_ref "$SPIDERPOOL_DEFAULT_MULTUS" "默认网络" || nad_ok=false
+        if [[ "$SPIDERPOOL_ADDITIONAL_MULTUS" != "$SPIDERPOOL_DEFAULT_MULTUS" ]]; then
+            validate_nad_ref "$SPIDERPOOL_ADDITIONAL_MULTUS" "附加网络" || nad_ok=false
+        fi
+        if [[ "$nad_ok" != "true" ]]; then
+            SPIDERPOOL_INSTALLED=false
+            log_warn "Spiderpool NAD 不可用 — Spiderpool 相关测试将被跳过"
+        fi
+    fi
+
     # 检测 LoadBalancer 支持 (MetalLB / Cloud LB)
     LB_SUPPORTED=false
-    if kc get crd ipaddresspools.metallb.io &>/dev/null 2>&1 || \
+    if [[ "$SKIP_LB" == "true" ]]; then
+        log_info "LoadBalancer: 已通过 --skip-lb 跳过"
+    elif kc get crd ipaddresspools.metallb.io &>/dev/null 2>&1 || \
        kc get svc -A --field-selector spec.type=LoadBalancer -o jsonpath='{.items[0].status.loadBalancer.ingress[0]}' 2>/dev/null | grep -q .; then
         LB_SUPPORTED=true
         log_info "LoadBalancer: 可用"
@@ -362,7 +489,13 @@ preflight_check() {
 create_resources() {
     log_section "创建测试资源 (namespace: $NAMESPACE)"
 
+    if kc get namespace "$NAMESPACE" &>/dev/null; then
+        log_fail "Namespace $NAMESPACE 已存在，为避免覆盖或误删已有资源，脚本不会复用已有 namespace"
+        log_info "请换一个 --namespace，或先手动删除: $(kubectl_repro_cmd delete namespace "$NAMESPACE")"
+        exit 1
+    fi
     kc create namespace "$NAMESPACE"
+    CREATED_NAMESPACE=true
     kc label namespace "$NAMESPACE" purpose=network-test --overwrite
 
     # ------------------------------------------------------------------
@@ -563,7 +696,11 @@ spec:
   - port: 80
     targetPort: 8080
     name: http
----
+EOF
+
+    if should_run_test pod2svc && [[ "$SKIP_LB" != "true" ]]; then
+        log_info "创建 LoadBalancer Service..."
+        kc apply -n "$NAMESPACE" -f - <<EOF
 apiVersion: v1
 kind: Service
 metadata:
@@ -577,6 +714,9 @@ spec:
     targetPort: 8080
     name: http
 EOF
+    else
+        log_info "跳过创建 LoadBalancer Service (--skip-lb 或未运行 pod2svc 测试)"
+    fi
 
     # ------------------------------------------------------------------
     # 如果 spiderpool 可用, 也创建 spiderpool 网络的 HTTP 服务端
@@ -784,13 +924,14 @@ test_pod_to_external() {
 test_pod_to_apiserver() {
     local src="$1" desc="$2"
     # 使用 ServiceAccount token 访问 /healthz
-    exec_in_pod_capture "$src" sh -c 'curl -sk --connect-timeout 5 -o /dev/null -w "%{http_code}" https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/healthz'
+    local rc=0
+    exec_in_pod_capture "$src" sh -c 'curl -sk --connect-timeout 5 -o /dev/null -w "%{http_code}" https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/healthz' || rc=$?
     local code="${LAST_OUTPUT:-000}"
-    if [[ "$code" =~ ^(200|401|403)$ ]]; then
+    if [[ $rc -eq 0 && "$code" =~ ^(200|401|403)$ ]]; then
         record_result pass "$desc (HTTP $code, 网络可达)"
     else
-        record_result fail "$desc (HTTP $code)"
-        record_fail_detail "$desc" "HTTP=$code" \
+        record_result fail "$desc (HTTP $code, exit=$rc)"
+        record_fail_detail "$desc" "HTTP=$code, exit=$rc" \
             "$(make_repro_cmd "$src" sh -c 'curl -vk --connect-timeout 5 https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/healthz')" \
             "apiserver"
     fi
@@ -934,7 +1075,7 @@ run_pod_to_svc_tests() {
     local nodeport
     nodeport=$(kc get svc -n "$NAMESPACE" svc-nodeport -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || echo "")
     local lb_ip
-    lb_ip=$(kc get svc -n "$NAMESPACE" svc-lb -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+    lb_ip=$(get_service_lb_addr svc-lb)
 
     local nodes
     read -r -a nodes <<< "$(get_nodes)"
@@ -980,7 +1121,9 @@ run_pod_to_svc_tests() {
         fi
 
         # LoadBalancer
-        if [[ -n "$lb_ip" ]]; then
+        if [[ "$SKIP_LB" == "true" ]]; then
+            record_result skip "[${label}] → LoadBalancer (--skip-lb)"
+        elif [[ -n "$lb_ip" ]]; then
             test_pod_to_svc "$src" "${lb_ip}:80" \
                 "[${label}] → LoadBalancer ($lb_ip:80)" "lb"
         else
@@ -1214,21 +1357,33 @@ run_network_policy_test() {
     log_section "测试 10: NetworkPolicy 验证 (可选)"
 
     # ---------- Type A (默认 CNI) NetworkPolicy ----------
-    _np_test_target "pod-default-2" "pod-default-1" "TypeA-默认CNI"
+    _np_test_target_tcp "http-server" "app" "http-server" "pod-default-1" "TypeA-默认CNI" 8080
 
     # ---------- Type B (Spiderpool macvlan) NetworkPolicy ----------
     # 改进: macvlan 直连模式 NetworkPolicy 通常不生效, 这是已知行为
     #       这里用 WARN 模式验证, 不算 FAIL.
     if [[ "$SPIDERPOOL_INSTALLED" == "true" ]]; then
-        _np_test_target_warn "pod-spider-2" "pod-spider-1" "TypeB-Spiderpool"
+        _np_test_target_tcp_warn "http-server-spider" "app" "http-server-spider" "pod-spider-1" "TypeB-Spiderpool" 8080
     fi
 }
 
 # 辅助: 严格模式测试 NetworkPolicy (CNI 必须支持，否则 FAIL)
-_np_test_target() {
-    local target="$1" src="$2" label="$3"
+# 使用 TCP curl 而不是 ICMP ping；ICMP 在 Kubernetes NetworkPolicy 中不是可移植语义。
+_np_test_target_tcp() {
+    local target="$1" selector_key="$2" selector_value="$3" src="$4" label="$5" port="${6:-8080}"
 
-    log_info "--- ${label}: NetworkPolicy on ${target} ---"
+    log_info "--- ${label}: NetworkPolicy on ${target} TCP/${port} ---"
+    local dst_ip; dst_ip=$(get_pod_ip "$target")
+    if [[ -z "$dst_ip" ]]; then
+        record_result skip "[${label}] NetworkPolicy: 无法获取目标 IP"
+        return
+    fi
+
+    if ! exec_in_pod "$src" curl -fsS --connect-timeout 5 "http://${dst_ip}:${port}" &>/dev/null; then
+        record_result skip "[${label}] NetworkPolicy: 基线 TCP 连接不通，无法验证策略"
+        return
+    fi
+
     kc apply -n "$NAMESPACE" -f - <<EOF >/dev/null
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -1237,49 +1392,53 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      instance: ${target}
+      ${selector_key}: ${selector_value}
   policyTypes:
   - Ingress
   ingress: []
 EOF
     sleep 3
 
-    local dst_ip; dst_ip=$(get_pod_ip "$target")
-    if [[ -z "$dst_ip" ]]; then
-        record_result skip "[${label}] NetworkPolicy: 无法获取目标 IP"
-        kc delete networkpolicy -n "$NAMESPACE" "deny-all-${target}" --ignore-not-found &>/dev/null
-        return
-    fi
-
-    if ! exec_in_pod "$src" ping -c 2 -W 3 "$dst_ip" &>/dev/null; then
-        record_result pass "[${label}] NetworkPolicy deny-all 生效: ping 被拒绝"
+    if ! exec_in_pod "$src" curl -fsS --connect-timeout 5 "http://${dst_ip}:${port}" &>/dev/null; then
+        record_result pass "[${label}] NetworkPolicy deny-all 生效: TCP 被拒绝"
     else
-        record_result fail "[${label}] NetworkPolicy deny-all 未生效: ping 仍成功 (CNI 可能不支持)"
+        record_result fail "[${label}] NetworkPolicy deny-all 未生效: TCP 仍成功 (CNI 可能不支持)"
         record_fail_detail "[${label}] NetworkPolicy 未生效" \
-            "ping 应被拒绝但成功了" \
-            "kubectl get networkpolicy -n $NAMESPACE; $(make_repro_cmd "$src" ping -c 2 "$dst_ip")" \
+            "TCP 应被拒绝但成功了" \
+            "$(kubectl_repro_cmd get networkpolicy -n "$NAMESPACE"); $(make_repro_cmd "$src" curl -v --connect-timeout 5 "http://${dst_ip}:${port}")" \
             "networkpolicy"
     fi
 
     kc delete networkpolicy -n "$NAMESPACE" "deny-all-${target}" --ignore-not-found &>/dev/null
     sleep 3
 
-    if exec_in_pod "$src" ping -c 2 -W 3 "$dst_ip" &>/dev/null; then
-        record_result pass "[${label}] NetworkPolicy 删除后恢复: ping 成功"
+    if exec_in_pod "$src" curl -fsS --connect-timeout 5 "http://${dst_ip}:${port}" &>/dev/null; then
+        record_result pass "[${label}] NetworkPolicy 删除后恢复: TCP 成功"
     else
-        record_result fail "[${label}] NetworkPolicy 删除后未恢复: ping 仍失败"
+        record_result fail "[${label}] NetworkPolicy 删除后未恢复: TCP 仍失败"
         record_fail_detail "[${label}] NetworkPolicy 删除后未恢复" \
-            "策略已删除但 ping 仍不通" \
-            "$(make_repro_cmd "$src" ping -c 2 "$dst_ip")" \
+            "策略已删除但 TCP 仍不通" \
+            "$(make_repro_cmd "$src" curl -v --connect-timeout 5 "http://${dst_ip}:${port}")" \
             "networkpolicy"
     fi
 }
 
 # 辅助: 宽松模式 (用于 Spiderpool macvlan, 不生效是预期行为)
-_np_test_target_warn() {
-    local target="$1" src="$2" label="$3"
+_np_test_target_tcp_warn() {
+    local target="$1" selector_key="$2" selector_value="$3" src="$4" label="$5" port="${6:-8080}"
 
-    log_info "--- ${label}: NetworkPolicy on ${target} (Spiderpool 通常不生效, WARN 模式) ---"
+    log_info "--- ${label}: NetworkPolicy on ${target} TCP/${port} (Spiderpool 通常不生效, WARN 模式) ---"
+    local dst_ip; dst_ip=$(get_pod_ip "$target")
+    if [[ -z "$dst_ip" ]]; then
+        record_result skip "[${label}] NetworkPolicy: 无法获取目标 IP"
+        return
+    fi
+
+    if ! exec_in_pod "$src" curl -fsS --connect-timeout 5 "http://${dst_ip}:${port}" &>/dev/null; then
+        record_result skip "[${label}] NetworkPolicy: 基线 TCP 连接不通，无法验证策略"
+        return
+    fi
+
     kc apply -n "$NAMESPACE" -f - <<EOF >/dev/null
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -1288,25 +1447,18 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      instance: ${target}
+      ${selector_key}: ${selector_value}
   policyTypes:
   - Ingress
   ingress: []
 EOF
     sleep 3
 
-    local dst_ip; dst_ip=$(get_pod_ip "$target")
-    if [[ -z "$dst_ip" ]]; then
-        record_result skip "[${label}] NetworkPolicy: 无法获取目标 IP"
-        kc delete networkpolicy -n "$NAMESPACE" "deny-all-${target}" --ignore-not-found &>/dev/null
-        return
-    fi
-
-    if ! exec_in_pod "$src" ping -c 2 -W 3 "$dst_ip" &>/dev/null; then
-        record_result pass "[${label}] NetworkPolicy 对 macvlan 生效: ping 被拒绝 (CNI 支持)"
+    if ! exec_in_pod "$src" curl -fsS --connect-timeout 5 "http://${dst_ip}:${port}" &>/dev/null; then
+        record_result pass "[${label}] NetworkPolicy 对 macvlan 生效: TCP 被拒绝 (CNI 支持)"
     else
         # macvlan 模式下 NetworkPolicy 通常不生效, 不算 FAIL
-        record_result skip "[${label}] NetworkPolicy 对 macvlan 不生效: ping 仍成功 (已知限制, 非问题)"
+        record_result skip "[${label}] NetworkPolicy 对 macvlan 不生效: TCP 仍成功 (已知限制, 非问题)"
         log_warn "  Spiderpool macvlan 模式下 NetworkPolicy 通常不生效 (流量绕过 host 协议栈)"
     fi
 
@@ -1474,6 +1626,12 @@ main() {
     if [[ -n "$SKIP_TESTS" ]]; then
         log_info "跳过: $SKIP_TESTS"
     fi
+    if [[ "$SKIP_LB" == "true" ]]; then
+        log_info "LoadBalancer 测试/资源已通过 --skip-lb 跳过"
+    fi
+
+    FAIL_TAGS_FILE="$(mktemp -t nettest_tags.XXXXXX)"
+    : > "$FAIL_TAGS_FILE"
 
     # 退出时打印报告 + 清理 tmp 文件 + namespace
     trap '_cleanup_all' EXIT

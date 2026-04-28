@@ -64,13 +64,14 @@ chmod +x k8s-net-test.sh
 ## 命令行参数
 
 ```
---namespace <ns>            指定测试 namespace（默认 net-test-<timestamp>）
+--namespace <ns>            指定测试 namespace（默认 net-test-<timestamp>；必须不存在，避免覆盖/误删已有资源）
 --skip-cleanup              跑完后保留资源（便于排查），默认会自动删
 --timeout <seconds>         等待 Pod Ready 的超时时间（默认 120）
 --spiderpool-subnet <name>  指定 Spiderpool 子网（用于 IPAM 注入）
 --spiderpool-multus <name>  Spiderpool NAD 名称（如 "spiderpool/l2-ens4"）
 --kubeconfig <path>         指定 kubeconfig 文件
 --verbose / -v              开启详细输出（失败时直接打印命令输出）
+--skip-lb                   不创建 / 不测试 LoadBalancer Service（避免云环境分配真实 LB）
 --only <name1,name2>        只跑指定测试（逗号分隔）
 --skip <name1,name2>        跳过指定测试
 -h / --help                 显示帮助
@@ -105,6 +106,9 @@ chmod +x k8s-net-test.sh
 
 # 指定 spiderpool 配置 + verbose
 ./k8s-net-test.sh --spiderpool-multus "spiderpool/l2-ens4" --verbose
+
+# 云环境避免创建真实 LoadBalancer
+./k8s-net-test.sh --skip-lb
 ```
 
 ---
@@ -141,8 +145,8 @@ chmod +x k8s-net-test.sh
 
 ### 4. NetworkPolicy (2 + 1 项)
 
-- 默认 CNI：deny-all 必须生效，恢复后必须能通（FAIL 严格判定）
-- Spiderpool macvlan：测试不生效是**预期**，标 SKIP + WARN（macvlan 流量绕过 host 协议栈，是已知限制）
+- 默认 CNI：通过 TCP curl 验证 deny-all 必须生效，恢复后必须能通（FAIL 严格判定）
+- Spiderpool macvlan：TCP 测试不生效是**预期**，标 SKIP + WARN（macvlan 流量绕过 host 协议栈，是已知限制）
 
 ---
 
