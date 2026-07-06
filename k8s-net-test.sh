@@ -14,17 +14,19 @@
 #   4. Pod → 外部网络 (互联网)
 #   5. Pod → Kubernetes API Server
 #   6. Pod → CoreDNS 解析
-#   7. NetworkPolicy 连通性 (如启用)
+#   7. NetworkPolicy 连通性 (Ingress + Egress, 如启用)
+#   8. 多后端 Service 黑洞检测 (部分后端不可达导致的间歇性超时)
 #
 # 使用方式:
 #   chmod +x k8s-net-test.sh
 #   ./k8s-net-test.sh [--namespace <ns>] [--skip-cleanup] [--timeout <seconds>]
 #                     [--spiderpool-subnet <name>] [--spiderpool-multus <name>]
 #                     [--kubeconfig <path>] [--verbose] [--skip-lb]
+#                     [--image <image>]
 #                     [--only <name1,name2>] [--skip <name1,name2>]
 #
 # 测试名称 (用于 --only / --skip):
-#   pod2pod, pod2svc, node2pod, external, dns, apiserver,
+#   pod2pod, pod2svc, multibackend, node2pod, external, dns, apiserver,
 #   samenode, mtu, hairpin, networkpolicy
 #
 # 排查记录 (失败时建议查看):
@@ -37,7 +39,8 @@ set -Eeuo pipefail
 # 配置
 # ============================================================================
 NAMESPACE="net-test-$(date +%s)"
-IMAGE="m.daocloud.io/docker.io/nicolaka/netshoot"
+# pin 版本保证长期可复现 (nc/shell 行为漂移会弄坏伪 HTTP server); 需要升级用 --image 覆盖
+IMAGE="m.daocloud.io/docker.io/nicolaka/netshoot:v0.16"
 TIMEOUT=120          # 等待 Pod Ready 的超时时间 (秒)
 SKIP_CLEANUP=false
 TEST_EXTERNAL_HOST="www.baidu.com"
@@ -96,7 +99,7 @@ ONLY_TESTS=""
 SKIP_TESTS=""
 SKIP_LB=false
 
-VALID_TESTS=(pod2pod pod2svc node2pod external dns apiserver samenode mtu hairpin networkpolicy)
+VALID_TESTS=(pod2pod pod2svc multibackend node2pod external dns apiserver samenode mtu hairpin networkpolicy)
 
 usage() {
     sed -n '2,/^$/p' "$0" | sed 's/^#//;s/^ //'
@@ -149,6 +152,7 @@ while [[ $# -gt 0 ]]; do
         --namespace)       require_arg "$1" "${2:-}"; NAMESPACE="$2"; shift 2 ;;
         --skip-cleanup)    SKIP_CLEANUP=true; shift ;;
         --timeout)         require_arg "$1" "${2:-}"; validate_positive_int "$2" "$1"; TIMEOUT="$2"; shift 2 ;;
+        --image)           require_arg "$1" "${2:-}"; IMAGE="$2"; shift 2 ;;
         --spiderpool-subnet)      require_arg "$1" "${2:-}"; SPIDERPOOL_SUBNET="$2"; shift 2 ;;
         --spiderpool-multus)      require_arg "$1" "${2:-}"; SPIDERPOOL_DEFAULT_MULTUS="$2"; SPIDERPOOL_ADDITIONAL_MULTUS="$2"; shift 2 ;;
         --kubeconfig)      require_arg "$1" "${2:-}"; KUBECONFIG_PATH="$2"; KUBECONFIG_ARGS=(--kubeconfig "$2"); shift 2 ;;
@@ -658,6 +662,7 @@ metadata:
   labels:
     app: http-server
     cni-type: default
+    multi-backend: "true"
 spec:
   nodeName: ${node1}
   containers:
@@ -728,6 +733,60 @@ spec:
 EOF
     else
         log_info "跳过创建 LoadBalancer Service (--skip-lb 或未运行 pod2svc 测试)"
+    fi
+
+    # ------------------------------------------------------------------
+    # 多后端 Service (黑洞检测): http-server-2 放在 node2, 与 http-server
+    # 组成跨节点双后端 — 单边路径不通时表现为部分请求超时
+    # ------------------------------------------------------------------
+    if should_run_test multibackend; then
+        log_info "创建多后端 Service (http-server-2 @ ${node2})..."
+        kc apply -n "$NAMESPACE" -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: http-server-2
+  labels:
+    app: http-server-2
+    cni-type: default
+    multi-backend: "true"
+spec:
+  nodeName: ${node2}
+  containers:
+  - name: netshoot
+    image: ${IMAGE}
+    command:
+    - sh
+    - -c
+    - |
+      while true; do
+        echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK from \$(hostname) at \$(date)" | nc -l -p 8080 -w 1 || true
+      done
+    ports:
+    - containerPort: 8080
+      name: http
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+  terminationGracePeriodSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-clusterip-multi
+spec:
+  type: ClusterIP
+  selector:
+    multi-backend: "true"
+  ports:
+  - port: 80
+    targetPort: 8080
+    name: http
+EOF
     fi
 
     # ------------------------------------------------------------------
@@ -909,6 +968,52 @@ test_pod_to_svc() {
         local repro; repro=$(make_repro_cmd "$src" curl -v --connect-timeout 5 "http://${svc_addr}")
         local reason="HTTP=${LAST_OUTPUT:-N/A}, exit=$rc"
         record_fail_detail "$desc [$src → $svc_addr]" "$reason" "$repro" "pod2svc" "$tag"
+    fi
+}
+
+# ---------- 多后端 Service 黑洞检测 ----------
+# 单次 curl 会漏掉"一半后端不可达"这种间歇性问题: 连发 N 次并核对命中的后端数。
+test_svc_multibackend() {
+    local src="$1" svc_ip="$2" desc_prefix="$3"
+    local n=10
+    local desc="${desc_prefix} 多后端 ClusterIP ${n} 连发 (${svc_ip}:80)"
+
+    # 循环放在 pod 内跑 (单次 exec, 避免 N 次 kubectl exec 开销);
+    # 失败即重试一次, 吸收 nc 单连接监听循环的重启空隙
+    local probe_script="
+for i in \$(seq 1 ${n}); do
+    out=\$(curl -s --connect-timeout 3 --max-time 5 http://${svc_ip}:80/ 2>/dev/null)
+    if [ -z \"\$out\" ]; then sleep 1; out=\$(curl -s --connect-timeout 3 --max-time 5 http://${svc_ip}:80/ 2>/dev/null); fi
+    echo \"\$out\" | grep -o 'OK from [^ ]*' || echo __FAIL__
+done"
+    local raw rc=0
+    raw=$(kc exec -n "$NAMESPACE" "$src" -- timeout 90 sh -c "$probe_script" 2>/dev/null) || rc=$?
+
+    local ok distinct
+    ok=$(echo "$raw" | grep -c "OK from" || true)
+    distinct=$(echo "$raw" | grep "OK from" | sort -u | grep -c . || true)
+
+    local ep_repro; ep_repro=$(kubectl_repro_cmd get endpoints -n "$NAMESPACE" svc-clusterip-multi -o wide)
+    if [[ "$ok" -eq "$n" && "$distinct" -ge 2 ]]; then
+        record_result pass "$desc: ${ok}/${n} 成功, 命中 ${distinct} 个后端  [$src]"
+    elif [[ "$ok" -eq "$n" ]]; then
+        record_result fail "$desc: ${ok}/${n} 成功但全部命中同一后端  [$src]"
+        record_fail_detail "$desc [$src]" \
+            "全部请求命中同一后端, 另一后端可能不在 endpoints 轮转中 (Pod NotReady?)" \
+            "$ep_repro" \
+            "multibackend"
+    elif [[ "$ok" -gt 0 ]]; then
+        record_result fail "$desc: 仅 ${ok}/${n} 成功 — 部分请求黑洞  [$src]"
+        record_fail_detail "$desc [$src]" \
+            "部分请求失败/超时, 典型原因: 某个后端所在节点的转发路径不通" \
+            "${ep_repro}; $(make_repro_cmd "$src" curl -sv --connect-timeout 3 "http://${svc_ip}:80/")" \
+            "multibackend" "partial-blackhole"
+    else
+        record_result fail "$desc: 0/${n} 成功  [$src]"
+        record_fail_detail "$desc [$src]" \
+            "全部请求失败 (exit=$rc), 先看 Pod→SVC 基础测试结果" \
+            "${ep_repro}; $(make_repro_cmd "$src" curl -sv --connect-timeout 3 "http://${svc_ip}:80/")" \
+            "multibackend"
     fi
 }
 
@@ -1196,6 +1301,33 @@ run_pod_to_svc_tests() {
     fi
 }
 
+run_multibackend_tests() {
+    CURRENT_CATEGORY="multibackend"
+    log_section "测试 2b: 多后端 Service 黑洞检测"
+
+    local svc_ip
+    svc_ip=$(kc get svc -n "$NAMESPACE" svc-clusterip-multi -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
+    if [[ -z "$svc_ip" ]]; then
+        record_result skip "多后端 Service svc-clusterip-multi 不存在"
+        return
+    fi
+
+    # 就绪后端不足 2 个测不出黑洞, 直接 skip 并提示
+    local ep_count
+    ep_count=$(kc get endpoints -n "$NAMESPACE" svc-clusterip-multi \
+        -o jsonpath='{range .subsets[*].addresses[*]}{.ip}{"\n"}{end}' 2>/dev/null | grep -c . || true)
+    if [[ "$ep_count" -lt 2 ]]; then
+        record_result skip "多后端黑洞检测: 就绪后端 ${ep_count}/2 (检查 http-server / http-server-2 是否 Ready)"
+        return
+    fi
+
+    test_svc_multibackend "pod-default-1" "$svc_ip" "[TypeA-默认CNI]"
+    if [[ "$SPIDERPOOL_INSTALLED" == "true" ]]; then
+        test_svc_multibackend "pod-spider-1" "$svc_ip" "[TypeB-Spiderpool]"
+        test_svc_multibackend "pod-dual-1"   "$svc_ip" "[TypeC-双网络]"
+    fi
+}
+
 run_node_to_pod_tests() {
     CURRENT_CATEGORY="node2pod"
     log_section "测试 3: Node → Pod 连通性"
@@ -1410,11 +1542,89 @@ run_network_policy_test() {
     # ---------- Type A (默认 CNI) NetworkPolicy ----------
     _np_test_target_tcp "http-server" "app" "http-server" "pod-default-1" "TypeA-默认CNI" 8080
 
+    # ---------- Type A (默认 CNI) Egress NetworkPolicy ----------
+    _np_test_egress_tcp "pod-default-1" "instance" "pod-default-1" "http-server" "TypeA-默认CNI" 8080
+
     # ---------- Type B (Spiderpool macvlan) NetworkPolicy ----------
     # 改进: macvlan 直连模式 NetworkPolicy 通常不生效, 这是已知行为
     #       这里用 WARN 模式验证, 不算 FAIL.
     if [[ "$SPIDERPOOL_INSTALLED" == "true" ]]; then
         _np_test_target_tcp_warn "http-server-spider" "app" "http-server-spider" "pod-spider-1" "TypeB-Spiderpool" 8080
+    fi
+}
+
+# 辅助: Egress 方向 deny-all (policy 选中源 pod, 验证出方向被阻断 + 删除后恢复)
+_np_test_egress_tcp() {
+    local src="$1" selector_key="$2" selector_value="$3" target="$4" label="$5" port="${6:-8080}"
+
+    log_info "--- ${label}: Egress NetworkPolicy on ${src} → ${target} TCP/${port} ---"
+    local dst_ip; dst_ip=$(get_pod_ip "$target")
+    if [[ -z "$dst_ip" ]]; then
+        record_result skip "[${label}] Egress NetworkPolicy: 无法获取目标 IP"
+        return
+    fi
+
+    # 基线走目标 IP 直连: egress deny 也会挡 DNS, 用 IP 排除 DNS 干扰
+    if ! exec_in_pod "$src" curl -fsS --connect-timeout 5 "http://${dst_ip}:${port}" &>/dev/null; then
+        record_result skip "[${label}] Egress NetworkPolicy: 基线 TCP 连接不通，无法验证策略"
+        return
+    fi
+
+    kc apply -n "$NAMESPACE" -f - <<EOF >/dev/null
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-egress-${src}
+spec:
+  podSelector:
+    matchLabels:
+      ${selector_key}: ${selector_value}
+  policyTypes:
+  - Egress
+  egress: []
+EOF
+
+    # 轮询等待策略下发
+    local enforced=false
+    local np_deadline=$((SECONDS + 15))
+    while [[ $SECONDS -lt $np_deadline ]]; do
+        if ! exec_in_pod "$src" curl -fsS --connect-timeout 3 "http://${dst_ip}:${port}" &>/dev/null; then
+            enforced=true
+            break
+        fi
+        sleep 2
+    done
+
+    if [[ "$enforced" == "true" ]]; then
+        record_result pass "[${label}] Egress deny-all 生效: 出方向 TCP 被拒绝"
+    else
+        record_result fail "[${label}] Egress deny-all 未生效: TCP 仍成功 (CNI 可能不支持 Egress 策略)"
+        record_fail_detail "[${label}] Egress NetworkPolicy 未生效" \
+            "出方向 TCP 应被拒绝但成功了" \
+            "$(kubectl_repro_cmd get networkpolicy -n "$NAMESPACE"); $(make_repro_cmd "$src" curl -v --connect-timeout 5 "http://${dst_ip}:${port}")" \
+            "networkpolicy"
+    fi
+
+    kc delete networkpolicy -n "$NAMESPACE" "deny-egress-${src}" --ignore-not-found &>/dev/null
+
+    # 轮询等待策略撤销生效
+    local recovered=false
+    np_deadline=$((SECONDS + 15))
+    while [[ $SECONDS -lt $np_deadline ]]; do
+        if exec_in_pod "$src" curl -fsS --connect-timeout 3 "http://${dst_ip}:${port}" &>/dev/null; then
+            recovered=true
+            break
+        fi
+        sleep 2
+    done
+    if [[ "$recovered" == "true" ]]; then
+        record_result pass "[${label}] Egress 策略删除后恢复: TCP 成功"
+    else
+        record_result fail "[${label}] Egress 策略删除后未恢复: TCP 仍失败"
+        record_fail_detail "[${label}] Egress 策略删除后未恢复" \
+            "策略已删除但出方向 TCP 仍不通" \
+            "$(make_repro_cmd "$src" curl -v --connect-timeout 5 "http://${dst_ip}:${port}")" \
+            "networkpolicy"
     fi
 }
 
@@ -1552,9 +1762,9 @@ print_report() {
 
     # ---------- 按测试类目分类汇总 ----------
     echo -e "${BOLD}按类目:${NC}"
-    local categories=(pod2pod pod2svc node2pod external dns apiserver samenode mtu hairpin networkpolicy)
+    local categories=(pod2pod pod2svc multibackend node2pod external dns apiserver samenode mtu hairpin networkpolicy)
     local labels=(
-        "Pod→Pod"  "Pod→SVC"  "Node→Pod" "External"  "DNS"
+        "Pod→Pod"  "Pod→SVC"  "Multi-Backend" "Node→Pod" "External"  "DNS"
         "APIServer" "Same/Cross" "MTU"  "Hairpin" "NetworkPolicy"
     )
     for i in "${!categories[@]}"; do
@@ -1656,6 +1866,15 @@ _print_smart_suggestions() {
         echo ""
     fi
 
+    # 多后端部分黑洞
+    if echo "$tags" | grep -q "partial-blackhole"; then
+        echo -e "  ${BOLD}⚠ 检测到多后端 Service 部分请求黑洞${NC}"
+        echo "    某个后端方向的转发路径不通 (kube-proxy 仍会把连接分给它 → 间歇性超时)"
+        echo "    kubectl get endpoints -n $NAMESPACE svc-clusterip-multi -o wide"
+        echo "    先看 Pod→Pod 跨节点测试是否失败; 也常见于 VXLAN checksum offload 问题"
+        echo ""
+    fi
+
     # NetworkPolicy 不生效
     if echo "$tags" | grep -q "networkpolicy"; then
         echo -e "  ${BOLD}⚠ 检测到 NetworkPolicy 异常${NC}"
@@ -1715,6 +1934,7 @@ main() {
     # 注: 测试名跟 --only/--skip 的 token 一一对应
     should_run_test pod2pod         && run_pod_to_pod_tests
     should_run_test pod2svc         && run_pod_to_svc_tests
+    should_run_test multibackend    && run_multibackend_tests
     should_run_test node2pod        && run_node_to_pod_tests
     should_run_test external        && run_external_tests
     should_run_test dns             && run_dns_tests

@@ -8,7 +8,7 @@ Kubernetes **多 CNI 网络连通性**全面验证脚本。一条命令在集群
 
 ## 特性
 
-- **零依赖部署**：单个 bash 脚本，仅依赖 `kubectl`。镜像走公共代理（`m.daocloud.io/docker.io/nicolaka/netshoot`），离线环境改一行变量即可。
+- **零依赖部署**：单个 bash 脚本，仅依赖 `kubectl`。镜像走公共代理（`m.daocloud.io/docker.io/nicolaka/netshoot:v0.16`，pin 版本保证长期可复现），离线/升级场景用 `--image` 覆盖即可。
 - **自适应跳过**：自动探测 Multus / Spiderpool / MetalLB / 多节点是否存在，没有则跳过对应测试，不会假报错。
 - **三类 Pod 网络**：自动覆盖
   - Type A — 默认 CNI
@@ -72,6 +72,7 @@ chmod +x k8s-net-test.sh
 --kubeconfig <path>         指定 kubeconfig 文件
 --verbose / -v              开启详细输出（失败时直接打印命令输出）
 --skip-lb                   不创建 / 不测试 LoadBalancer Service（避免云环境分配真实 LB）
+--image <image>             覆盖测试镜像（默认 m.daocloud.io/docker.io/nicolaka/netshoot:v0.16）
 --only <name1,name2>        只跑指定测试（逗号分隔）
 --skip <name1,name2>        跳过指定测试
 -h / --help                 显示帮助
@@ -83,6 +84,7 @@ chmod +x k8s-net-test.sh
 |---|---|
 | `pod2pod`       | Pod → Pod (同节点 + 跨节点 + 跨 CNI 互通) |
 | `pod2svc`       | Pod → Service (ClusterIP / NodePort / LoadBalancer) |
+| `multibackend`  | 多后端 Service 黑洞检测（跨节点双后端连发 10 次，识别间歇性超时） |
 | `node2pod`      | 节点 → Pod (本节点 + 跨节点) |
 | `external`      | Pod → 外部 IP / 域名 |
 | `dns`           | 集群内 DNS + 外部 DNS |
@@ -143,10 +145,22 @@ chmod +x k8s-net-test.sh
 
 > ⚠️ 改进前直接用 1400 DF ping 判断成功，导致连通性挂的时候被误诊为 "MTU 过小"，浪费几小时排查时间。
 
-### 4. NetworkPolicy (2 + 1 项)
+### 4. NetworkPolicy (4 + 1 项)
 
-- 默认 CNI：通过 TCP curl 验证 deny-all 必须生效，恢复后必须能通（FAIL 严格判定）
+- 默认 CNI Ingress：通过 TCP curl 验证 deny-all 必须生效，恢复后必须能通（FAIL 严格判定）
+- 默认 CNI Egress：对源 pod 施加 egress deny-all，验证出方向被阻断 + 删除后恢复（基线走目标 IP 直连，排除 DNS 干扰）
 - Spiderpool macvlan：TCP 测试不生效是**预期**，标 SKIP + WARN（macvlan 流量绕过 host 协议栈，是已知限制）
+- 生效/撤销判定均为 15s 轮询，避免慢 CNI 下发延迟造成误报
+
+### 5. 多后端 Service 黑洞检测
+
+`http-server`(node1) + `http-server-2`(node2) 组成跨节点双后端，从 A/B/C 三类源 pod 各连发 10 次 ClusterIP 请求并解析响应中的后端 hostname：
+
+| 结果 | 判定 |
+|---|---|
+| 10/10 成功且命中 ≥2 个后端 | PASS |
+| 10/10 成功但全部同一后端 | FAIL（另一后端不在轮转中） |
+| 部分成功 | FAIL（**部分请求黑洞** — 单次 curl 测试会漏掉的间歇性问题） |
 
 ---
 
@@ -218,6 +232,7 @@ chmod +x k8s-net-test.sh
 │                                                                          │
 │  HTTP 服务端                                                              │
 │  http-server          [node1, Calico pod]                                │
+│  http-server-2        [node2, Calico pod, 多后端检测]                      │
 │  http-server-spider   [node1, Spiderpool pod]                            │
 │                                                                          │
 │  Services                                                                │
@@ -225,6 +240,7 @@ chmod +x k8s-net-test.sh
 │  svc-nodeport           (NodePort    → http-server)                      │
 │  svc-lb                 (LoadBalancer → http-server)                     │
 │  svc-clusterip-spider   (ClusterIP   → http-server-spider)               │
+│  svc-clusterip-multi    (ClusterIP   → http-server + http-server-2)      │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
