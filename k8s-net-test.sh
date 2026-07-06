@@ -163,7 +163,8 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             usage
             exit 0 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        # die 用 exit 2: 退出码 1 保留给"有测试失败", 避免 CI 误判
+        *) die "未知参数: $1 (用 -h 查看帮助)" ;;
     esac
 done
 
@@ -287,10 +288,13 @@ make_repro_cmd() {
 }
 
 # 等待单个 Pod Ready
+# 第 2 个参数可选: 绝对 deadline (SECONDS 基准)。多个 Pod 并发启动, 调用方传同一个
+# deadline 让整批共享 TIMEOUT, 避免逐个等待时最坏 N×TIMEOUT。
+# deadline 已过也至少检查一次状态 (前面的 Pod 等待期间这个可能早就 Ready 了)。
 wait_pod_ready() {
     local pod="$1"
-    local deadline=$((SECONDS + TIMEOUT))
-    while [[ $SECONDS -lt $deadline ]]; do
+    local deadline="${2:-$((SECONDS + TIMEOUT))}"
+    while :; do
         local phase
         phase=$(kc get pod -n "$NAMESPACE" "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
         if [[ "$phase" == "Running" ]]; then
@@ -301,6 +305,7 @@ wait_pod_ready() {
                 return 0
             fi
         fi
+        [[ $SECONDS -ge $deadline ]] && break
         sleep 2
     done
     log_warn "Pod $pod 未在 ${TIMEOUT}s 内就绪 (当前状态: $(kc get pod -n "$NAMESPACE" "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || echo 'Unknown'))"
@@ -446,6 +451,9 @@ preflight_check() {
     local node_count
     node_count=$(kc get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
     log_info "集群节点数: $node_count"
+    if [[ "$node_count" -eq 0 ]]; then
+        echo "错误: 集群没有任何节点，无法创建测试 Pod" >&2; exit 1
+    fi
     if [[ "$node_count" -lt 2 ]]; then
         log_warn "集群只有 $node_count 个节点，跨节点测试将被跳过"
     fi
@@ -853,13 +861,14 @@ EOF
     # ------------------------------------------------------------------
     # 等待所有 Pod 就绪
     # ------------------------------------------------------------------
-    log_info "等待所有测试 Pod 就绪..."
+    log_info "等待所有测试 Pod 就绪 (整批共享 ${TIMEOUT}s)..."
     local all_pods
     all_pods=$(kc get pods -n "$NAMESPACE" -o jsonpath='{.items[*].metadata.name}')
     local failed_pods=()
+    local wait_deadline=$((SECONDS + TIMEOUT))
     for pod in $all_pods; do
         log_info "  等待 $pod ..."
-        if ! wait_pod_ready "$pod"; then
+        if ! wait_pod_ready "$pod" "$wait_deadline"; then
             failed_pods+=("$pod")
         fi
     done

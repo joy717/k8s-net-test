@@ -1,6 +1,6 @@
 # k8s-net-test
 
-Kubernetes **多 CNI 网络连通性**全面验证脚本。一条命令在集群里部署一组测试 pod，覆盖 Pod↔Pod、Pod↔Service、Pod↔外部、DNS、API Server、MTU、Hairpin、NetworkPolicy 等 10 大类共 70+ 项检查，并产出**带分类汇总和智能排查建议**的报告。
+Kubernetes **多 CNI 网络连通性**全面验证脚本。一条命令在集群里部署一组测试 pod，覆盖 Pod↔Pod、Pod↔Service、多后端黑洞检测、Pod↔外部、DNS、API Server、MTU、Hairpin、NetworkPolicy (Ingress + Egress) 等 11 大类共 80+ 项检查，并产出**带分类汇总和智能排查建议**的报告。
 
 特别针对 **Spiderpool (macvlan) + 默认 CNI (Calico/Cilium/...) + MetalLB** 这种"underlay + overlay 共存"的复杂环境优化，能识别同节点 / 跨节点路径差异，避免常见的误诊断。
 
@@ -40,21 +40,22 @@ chmod +x k8s-net-test.sh
 正常情况下你会看到类似：
 
 ```
-  通过: 76 / 77
+  通过: 89 / 90
   失败: 0
   跳过: 1
 
 按类目:
   ✓  Pod→Pod        16/16  pass
-  ✓  Pod→SVC        25/25  pass
+  ✓  Pod→SVC        30/30  pass
+  ✓  Multi-Backend  3/3    pass
   ✓  Node→Pod       5/5    pass
   ✓  External       6/6    pass
-  ✓  DNS            6/6    pass
+  ✓  DNS            9/9    pass
   ✓  APIServer      3/3    pass
   ✓  Same/Cross     6/6    pass
   ✓  MTU            6/6    pass
   ✓  Hairpin        1/1    pass
-  ✓  NetworkPolicy  2/3    pass  1 skip
+  ✓  NetworkPolicy  4/5    pass  1 skip
 
 ✅ 所有测试通过!
 ```
