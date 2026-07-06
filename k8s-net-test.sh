@@ -32,6 +32,13 @@
 # 排查记录 (失败时建议查看):
 #   TROUBLESHOOTING.md  — 已知问题、根因和修复方案
 
+# bash >= 4.4 硬性要求: declare -A 需要 4.0+; set -u 下空数组展开 ("${arr[@]}") 需要 4.4+
+# macOS 自带 bash 3.2 会在 declare -A 处报一句莫名其妙的错后死掉, 这里提前给出明确提示
+if [[ -z "${BASH_VERSINFO:-}" || ${BASH_VERSINFO[0]} -lt 4 || ( ${BASH_VERSINFO[0]} -eq 4 && ${BASH_VERSINFO[1]} -lt 4 ) ]]; then
+    echo "错误: 需要 bash >= 4.4 (当前: ${BASH_VERSION:-unknown})。macOS 请 brew install bash 后用新 bash 运行" >&2
+    exit 2
+fi
+
 # -E (errtrace): ERR trap 需要被函数继承, 否则 on_unexpected_error 对函数内失败不生效
 set -Eeuo pipefail
 
@@ -447,12 +454,12 @@ preflight_check() {
     fi
     log_info "集群连接正常"
 
-    # 检测节点数
+    # 检测节点数 (守护管道: list nodes 失败时走下面的明确报错, 而不是被 set -e 带诊断栈杀掉)
     local node_count
-    node_count=$(kc get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    node_count=$(kc get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ' || true)
     log_info "集群节点数: $node_count"
-    if [[ "$node_count" -eq 0 ]]; then
-        echo "错误: 集群没有任何节点，无法创建测试 Pod" >&2; exit 1
+    if [[ -z "$node_count" || "$node_count" -eq 0 ]]; then
+        echo "错误: 未发现任何节点 (集群没有节点，或当前账号无 list nodes 权限)" >&2; exit 1
     fi
     if [[ "$node_count" -lt 2 ]]; then
         log_warn "集群只有 $node_count 个节点，跨节点测试将被跳过"
@@ -863,7 +870,7 @@ EOF
     # ------------------------------------------------------------------
     log_info "等待所有测试 Pod 就绪 (整批共享 ${TIMEOUT}s)..."
     local all_pods
-    all_pods=$(kc get pods -n "$NAMESPACE" -o jsonpath='{.items[*].metadata.name}')
+    all_pods=$(kc get pods -n "$NAMESPACE" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
     local failed_pods=()
     local wait_deadline=$((SECONDS + TIMEOUT))
     for pod in $all_pods; do
@@ -873,22 +880,24 @@ EOF
         fi
     done
 
+    # 诊断输出全部兜底: 这里跑在"已经出问题"的路径上, pod 中途被删/API 抖动
+    # 不能反过来把整个测试进程杀掉
     if [[ ${#failed_pods[@]} -gt 0 ]]; then
         log_warn "以下 Pod 未就绪，相关测试可能失败: ${failed_pods[*]}"
         log_info "Pod 状态详情:"
-        kc get pods -n "$NAMESPACE" -o wide
+        kc get pods -n "$NAMESPACE" -o wide || true
         echo ""
         for fp in "${failed_pods[@]}"; do
             log_info "--- $fp events ---"
-            kc describe pod -n "$NAMESPACE" "$fp" 2>/dev/null | tail -20
+            kc describe pod -n "$NAMESPACE" "$fp" 2>/dev/null | tail -20 || true
         done
     fi
 
     log_info "当前 Pod 状态:"
-    kc get pods -n "$NAMESPACE" -o wide
+    kc get pods -n "$NAMESPACE" -o wide || true
     echo ""
     log_info "当前 Service 状态:"
-    kc get svc -n "$NAMESPACE" -o wide
+    kc get svc -n "$NAMESPACE" -o wide || true
 }
 
 # ============================================================================
@@ -996,7 +1005,8 @@ for i in \$(seq 1 ${n}); do
     echo \"\$out\" | grep -o 'OK from [^ ]*' || echo __FAIL__
 done"
     local raw rc=0
-    raw=$(kc exec -n "$NAMESPACE" "$src" -- timeout 90 sh -c "$probe_script" 2>/dev/null) || rc=$?
+    # 130s: 最坏情况每次迭代 curl 5s + sleep 1 + 重试 5s = 11s × 10 次 = 110s, 留余量
+    raw=$(kc exec -n "$NAMESPACE" "$src" -- timeout 130 sh -c "$probe_script" 2>/dev/null) || rc=$?
 
     local ok distinct
     ok=$(echo "$raw" | grep -c "OK from" || true)
@@ -1076,13 +1086,13 @@ test_pod_to_apiserver() {
 test_pod_dns() {
     local src="$1" desc="$2"
 
-    # 集群内 Service DNS
-    if exec_in_pod_capture "$src" nslookup "kubernetes.default.svc.cluster.local"; then
+    # 集群内 Service DNS (.svc 短后缀: 自定义 cluster domain 也能经 search 域解析)
+    if exec_in_pod_capture "$src" nslookup "kubernetes.default.svc"; then
         record_result pass "${desc}: 集群内 DNS (kubernetes.default)"
     else
         record_result fail "${desc}: 集群内 DNS (kubernetes.default)"
         record_fail_detail "${desc}: 集群内 DNS" "$(last_lines 2)" \
-            "$(make_repro_cmd "$src" nslookup kubernetes.default.svc.cluster.local)" \
+            "$(make_repro_cmd "$src" nslookup kubernetes.default.svc)" \
             "dns" "internal-dns"
     fi
 
@@ -1267,8 +1277,8 @@ run_pod_to_svc_tests() {
                 "[${label}] → ClusterIP ($clusterip:80)" "clusterip"
         fi
 
-        # ClusterIP - by DNS name
-        test_pod_to_svc "$src" "svc-clusterip.${NAMESPACE}.svc.cluster.local:80" \
+        # ClusterIP - by DNS name (.svc 短后缀, 兼容自定义 cluster domain)
+        test_pod_to_svc "$src" "svc-clusterip.${NAMESPACE}.svc:80" \
             "[${label}] → ClusterIP (DNS: svc-clusterip)" "clusterip-dns"
 
         # NodePort (node1 = http-server 所在节点)
@@ -1507,14 +1517,36 @@ run_mtu_test() {
                 continue
             fi
 
-            # ---------- 步骤 2: 1400 字节 DF ping ----------
-            if exec_in_pod_capture "$src" ping -c 2 -W 5 -M do -s 1400 "$dst_ip"; then
-                record_result pass "${prefix}: 1400 字节 DF ping 成功"
+            # ---------- 步骤 2: 按源出接口 MTU 做 DF ping ----------
+            # 固定 1400 会误伤合法小 MTU 集群 (WireGuard/双层封装常见 1340-1400)。
+            # 真 MTU 问题的准确定义是: 接口宣称的 MTU, 路径承载不了。
+            # 所以先查去往目标的出接口 (Type C 到 spider 目标走 net1 而非 eth0),
+            # 按其 MTU 计算 payload; 读不到时退回固定 1400。
+            local src_dev src_mtu
+            src_dev=$(exec_in_pod "$src" sh -c "ip -o route get ${dst_ip} 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p'" 2>/dev/null | tr -d '[:space:]' || true)
+            src_mtu=""
+            if [[ -n "$src_dev" ]]; then
+                src_mtu=$(exec_in_pod "$src" cat "/sys/class/net/${src_dev}/mtu" 2>/dev/null | tr -cd '0-9' || true)
+            fi
+            if [[ -n "$src_mtu" && "$src_mtu" -gt 128 ]]; then
+                local payload=$((src_mtu - 28))
+                if exec_in_pod_capture "$src" ping -c 2 -W 5 -M do -s "$payload" "$dst_ip"; then
+                    record_result pass "${prefix}: 接口 MTU ${src_mtu} (dev ${src_dev}) DF ping 成功"
+                else
+                    record_result fail "${prefix}: 接口宣称 MTU ${src_mtu} (dev ${src_dev}) 但路径承载不了 (真 MTU 问题)"
+                    record_fail_detail "${prefix}: MTU ${src_mtu} DF ping 失败" "$(last_lines 2)" \
+                        "$(make_repro_cmd "$src" ping -M do -s "$payload" "$dst_ip")" \
+                        "mtu" "real-mtu-issue"
+                fi
             else
-                record_result fail "${prefix}: 1400 字节 DF ping 失败 (真 MTU 问题: 小包通,大包不通)"
-                record_fail_detail "${prefix}: 1400 DF ping 失败" "$(last_lines 2)" \
-                    "$(make_repro_cmd "$src" ping -M do -s 1400 "$dst_ip")" \
-                    "mtu" "real-mtu-issue"
+                if exec_in_pod_capture "$src" ping -c 2 -W 5 -M do -s 1400 "$dst_ip"; then
+                    record_result pass "${prefix}: 1400 字节 DF ping 成功 (未能读取接口 MTU, 用固定值)"
+                else
+                    record_result fail "${prefix}: 1400 字节 DF ping 失败 (真 MTU 问题: 小包通,大包不通)"
+                    record_fail_detail "${prefix}: 1400 DF ping 失败" "$(last_lines 2)" \
+                        "$(make_repro_cmd "$src" ping -M do -s 1400 "$dst_ip")" \
+                        "mtu" "real-mtu-issue"
+                fi
             fi
 
             # ---------- 步骤 3: 探测实际 MTU ----------
@@ -1540,7 +1572,9 @@ run_hairpin_test() {
 
     # Pod 通过 Service 访问自身 (hairpin NAT)
     log_info "--- Pod 通过 ClusterIP Service 访问自身 ---"
-    test_pod_to_svc "http-server" "svc-clusterip.${NAMESPACE}.svc.cluster.local:80" \
+    # 用 .svc 短后缀而非 .svc.cluster.local: 自定义 cluster domain 的集群
+    # 会经 resolv.conf search 第三项 (<domain>) 正确解析, 不产生假失败
+    test_pod_to_svc "http-server" "svc-clusterip.${NAMESPACE}.svc:80" \
         "[Hairpin] http-server → 自身 ClusterIP Service" "hairpin"
 }
 
@@ -1593,13 +1627,18 @@ spec:
   egress: []
 EOF
 
-    # 轮询等待策略下发
-    local enforced=false
-    local np_deadline=$((SECONDS + 15))
+    # 轮询等待策略下发; 连续 2 次失败才判定生效 (理由同 Ingress 测试)
+    local enforced=false consec_fail=0
+    local np_deadline=$((SECONDS + 20))
     while [[ $SECONDS -lt $np_deadline ]]; do
         if ! exec_in_pod "$src" curl -fsS --connect-timeout 3 "http://${dst_ip}:${port}" &>/dev/null; then
-            enforced=true
-            break
+            consec_fail=$((consec_fail + 1))
+            if [[ $consec_fail -ge 2 ]]; then
+                enforced=true
+                break
+            fi
+        else
+            consec_fail=0
         fi
         sleep 2
     done
@@ -1668,13 +1707,20 @@ spec:
   ingress: []
 EOF
 
-    # 轮询等待策略下发 (慢 CNI 上固定 sleep 3 会误报"未生效")
-    local enforced=false
-    local np_deadline=$((SECONDS + 15))
+    # 轮询等待策略下发 (慢 CNI 上固定 sleep 3 会误报"未生效")。
+    # 必须连续 2 次失败才判定生效: 单次失败可能只是 nc 重启空隙 / exec 抖动,
+    # 会把不支持 NetworkPolicy 的 CNI 误判成 PASS (安全断言假阳性)。
+    local enforced=false consec_fail=0
+    local np_deadline=$((SECONDS + 20))
     while [[ $SECONDS -lt $np_deadline ]]; do
         if ! exec_in_pod "$src" curl -fsS --connect-timeout 3 "http://${dst_ip}:${port}" &>/dev/null; then
-            enforced=true
-            break
+            consec_fail=$((consec_fail + 1))
+            if [[ $consec_fail -ge 2 ]]; then
+                enforced=true
+                break
+            fi
+        else
+            consec_fail=0
         fi
         sleep 2
     done
@@ -1744,7 +1790,16 @@ spec:
 EOF
     sleep 3
 
+    # 连续 2 次失败才算生效 (单次失败可能是 nc 空隙误报);
+    # macvlan 预期不生效, 首次探测成功即快速走 skip 分支, 不浪费时间
+    local blocked=false
     if ! exec_in_pod "$src" curl -fsS --connect-timeout 5 "http://${dst_ip}:${port}" &>/dev/null; then
+        sleep 2
+        if ! exec_in_pod "$src" curl -fsS --connect-timeout 5 "http://${dst_ip}:${port}" &>/dev/null; then
+            blocked=true
+        fi
+    fi
+    if [[ "$blocked" == "true" ]]; then
         record_result pass "[${label}] NetworkPolicy 对 macvlan 生效: TCP 被拒绝 (CNI 支持)"
     else
         # macvlan 模式下 NetworkPolicy 通常不生效, 不算 FAIL

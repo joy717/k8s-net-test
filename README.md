@@ -142,7 +142,7 @@ chmod +x k8s-net-test.sh
 
 每项做两步：
 1. **小包连通性检查** — 不通直接标"连通性失败 (非 MTU 问题)"
-2. **1400 字节 DF ping** — 失败标"真 MTU 问题"
+2. **按源出接口宣称的 MTU 做 DF ping** — 接口说多大就必须扛多大，失败才是"真 MTU 问题"。不会误伤 WireGuard/双层封装这类合法小 MTU 集群；读不到接口 MTU 时退回固定 1400
 
 > ⚠️ 改进前直接用 1400 DF ping 判断成功，导致连通性挂的时候被误诊为 "MTU 过小"，浪费几小时排查时间。
 
@@ -151,7 +151,7 @@ chmod +x k8s-net-test.sh
 - 默认 CNI Ingress：通过 TCP curl 验证 deny-all 必须生效，恢复后必须能通（FAIL 严格判定）
 - 默认 CNI Egress：对源 pod 施加 egress deny-all，验证出方向被阻断 + 删除后恢复（基线走目标 IP 直连，排除 DNS 干扰）
 - Spiderpool macvlan：TCP 测试不生效是**预期**，标 SKIP + WARN（macvlan 流量绕过 host 协议栈，是已知限制）
-- 生效/撤销判定均为 15s 轮询，避免慢 CNI 下发延迟造成误报
+- 生效/撤销判定均为 20s 轮询；判定"生效"需**连续 2 次**连接失败，单次抖动不会把不支持 NetworkPolicy 的 CNI 误判成通过
 
 ### 5. 多后端 Service 黑洞检测
 
