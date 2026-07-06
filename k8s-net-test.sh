@@ -30,7 +30,8 @@
 # 排查记录 (失败时建议查看):
 #   TROUBLESHOOTING.md  — 已知问题、根因和修复方案
 
-set -euo pipefail
+# -E (errtrace): ERR trap 需要被函数继承, 否则 on_unexpected_error 对函数内失败不生效
+set -Eeuo pipefail
 
 # ============================================================================
 # 配置
@@ -302,9 +303,9 @@ wait_pod_ready() {
     return 1
 }
 
-# 获取 Pod IP (默认网络)
+# 获取 Pod IP (默认网络); kc 失败时返回空而不是非 0 (set -e 下 $() 赋值不能失败)
 get_pod_ip() {
-    kc get pod -n "$NAMESPACE" "$1" -o jsonpath='{.status.podIP}' 2>/dev/null
+    kc get pod -n "$NAMESPACE" "$1" -o jsonpath='{.status.podIP}' 2>/dev/null || true
 }
 
 # 获取 Pod 的 Multus 附加网络 IP
@@ -328,21 +329,22 @@ except: pass
     fi
 }
 
-# 获取节点列表 (优先返回可调度的 worker，再 fallback 到所有 Ready 节点)
+# 获取节点列表 (优先返回 Ready 且未 cordon 的节点，再 fallback 到所有节点)
 get_nodes() {
-    # 优先取 Ready 且不是 NoSchedule 的 worker
-    local schedulable
-    schedulable=$(kc get nodes -o jsonpath='{range .items[?(@.spec.unschedulable!=true)]}{.metadata.name} {end}' 2>/dev/null | tr -s ' ')
-    if [[ -n "$schedulable" ]]; then
-        echo "$schedulable" | xargs
+    # NotReady 节点必须排除: pod 用 nodeName 硬 pin (绕过调度器), 落在死节点上会全部起不来
+    local candidates
+    candidates=$(kc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.unschedulable}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null \
+        | awk -F'\t' '$2 != "true" && $3 == "True" {printf "%s ", $1}' || true)
+    if [[ -n "${candidates// /}" ]]; then
+        echo "$candidates" | xargs
     else
-        kc get nodes -o jsonpath='{.items[*].metadata.name}'
+        kc get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true
     fi
 }
 
 # 获取节点 InternalIP
 get_node_ip() {
-    kc get node "$1" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'
+    kc get node "$1" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true
 }
 
 get_service_lb_addr() {
@@ -355,11 +357,13 @@ get_service_lb_addr() {
     fi
     hostname=$(kc get svc -n "$NAMESPACE" "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
     [[ -n "$hostname" ]] && echo "$hostname"
+    # 无 LB 地址时也必须返回 0: 调用方在 set -e 下用 $(...) 赋值, 返回 1 会终止整个脚本
+    return 0
 }
 
 # 获取 Pod 所在节点
 get_pod_node() {
-    kc get pod -n "$NAMESPACE" "$1" -o jsonpath='{.spec.nodeName}'
+    kc get pod -n "$NAMESPACE" "$1" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true
 }
 
 # 校验 Multus NAD 引用。由于测试 namespace 是临时创建的，Spiderpool NAD 必须写成 namespace/name。
@@ -422,6 +426,11 @@ preflight_check() {
         echo "错误: kubectl 未安装" >&2; exit 1
     fi
     log_info "kubectl 版本: $(kubectl version --client --short 2>/dev/null || kubectl version --client 2>/dev/null | head -1)"
+
+    # python3 用于解析 Multus network-status 注解 (get_pod_multus_ip)
+    if ! command -v python3 &>/dev/null; then
+        log_warn "python3 未安装 — 无法解析 Multus 附加网络 IP, 相关测试将被 skip"
+    fi
 
     # 集群连接
     if ! kc cluster-info &>/dev/null; then
@@ -496,7 +505,10 @@ create_resources() {
     fi
     kc create namespace "$NAMESPACE"
     CREATED_NAMESPACE=true
-    kc label namespace "$NAMESPACE" purpose=network-test --overwrite
+    # enforce=privileged: node2pod 的 hostNetwork 探测 pod 和 debug node 的 debugger pod
+    # 在启用 Pod Security Admission 的集群上需要 privileged 级别
+    kc label namespace "$NAMESPACE" purpose=network-test \
+        pod-security.kubernetes.io/enforce=privileged --overwrite
 
     # ------------------------------------------------------------------
     # 获取调度节点 (尽量分布到不同节点)
@@ -879,9 +891,18 @@ test_pod_to_pod_multus_ping() {
 # 第 4 个参数可选: tag (lb/clusterip/nodeport/...) 用于失败标签
 test_pod_to_svc() {
     local src="$1" svc_addr="$2" desc="$3" tag="${4:-svc}"
-    local rc=0
-    exec_in_pod_capture "$src" curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 "http://${svc_addr}" || rc=$?
-    if [[ $rc -eq 0 ]] && echo "$LAST_OUTPUT" | grep -q "200"; then
+    # nc 伪 HTTP server 单连接 + 循环重启之间有空隙, 失败时重试一次避免偶发 refused 误报
+    local rc=0 ok=false attempt
+    for attempt in 1 2; do
+        rc=0
+        exec_in_pod_capture "$src" curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 "http://${svc_addr}" || rc=$?
+        if [[ $rc -eq 0 ]] && echo "$LAST_OUTPUT" | grep -q "200"; then
+            ok=true
+            break
+        fi
+        sleep 1
+    done
+    if [[ "$ok" == "true" ]]; then
         record_result pass "$desc  [$src → $svc_addr]"
     else
         record_result fail "$desc  [$src → $svc_addr]"
@@ -951,6 +972,16 @@ test_pod_dns() {
             "dns" "internal-dns"
     fi
 
+    # 短名解析 (走 resolv.conf 的 search 域; ndots/search 配置问题只在这里暴露)
+    if exec_in_pod_capture "$src" nslookup "svc-clusterip"; then
+        record_result pass "${desc}: 集群内 DNS 短名 (svc-clusterip)"
+    else
+        record_result fail "${desc}: 集群内 DNS 短名 (svc-clusterip)"
+        record_fail_detail "${desc}: 集群内 DNS 短名 (svc-clusterip)" "$(last_lines 2)" \
+            "$(make_repro_cmd "$src" nslookup svc-clusterip)" \
+            "dns" "internal-dns"
+    fi
+
     # 外部域名 DNS
     if exec_in_pod_capture "$src" nslookup "$TEST_EXTERNAL_HOST"; then
         record_result pass "${desc}: 外部 DNS ($TEST_EXTERNAL_HOST)"
@@ -973,10 +1004,12 @@ test_node_to_pod() {
     fi
 
     # 使用 kubectl debug node 方式, 在节点上执行 ping
-    # 兼容: 如果 debug node 不可用, 使用 nsenter 方式
+    # 兼容: 如果 debug node 不可用, 使用 hostNetwork Pod 方式
+    # --attach=true 必须显式给出: 默认 false 时命令输出不会回传, __PING_OK__ 永远匹配不到
+    # -n 指定测试 namespace: debugger pod 随 namespace 清理, 不会泄漏到 default
     local result
-    result=$(kc debug "node/${node}" --image="${IMAGE}" -q -- \
-        sh -c "ping -c 2 -W 3 ${pod_ip} && echo __PING_OK__" 2>&1 || true)
+    result=$(kc debug "node/${node}" -n "$NAMESPACE" --image="${IMAGE}" -q --attach=true -- \
+        sh -c "ping -c 2 -W 3 ${pod_ip} && echo __PING_OK__" 2>&1 </dev/null || true)
 
     if echo "$result" | grep -q "__PING_OK__"; then
         record_result pass "$desc  [node:$node → $pod ($pod_ip)]"
@@ -1076,11 +1109,23 @@ run_pod_to_svc_tests() {
     nodeport=$(kc get svc -n "$NAMESPACE" svc-nodeport -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || echo "")
     local lb_ip
     lb_ip=$(get_service_lb_addr svc-lb)
+    # LB 控制器分配 VIP 需要时间 (MetalLB 数秒, 云 LB 可能数分钟), 确认有 LB 支持时轮询等待
+    if [[ -z "$lb_ip" && "$SKIP_LB" != "true" && "$LB_SUPPORTED" == "true" ]]; then
+        log_info "等待 LoadBalancer 分配地址 (最多 60s)..."
+        local lb_deadline=$((SECONDS + 60))
+        while [[ -z "$lb_ip" && $SECONDS -lt $lb_deadline ]]; do
+            sleep 5
+            lb_ip=$(get_service_lb_addr svc-lb)
+        done
+    fi
 
     local nodes
     read -r -a nodes <<< "$(get_nodes)"
     local node_ip
     node_ip=$(get_node_ip "${nodes[0]}")
+    # node2 上没有 http-server 后端: 经 node2 的 NodePort 走 kube-proxy 跨节点转发路径
+    local node2_ip=""
+    [[ ${#nodes[@]} -ge 2 ]] && node2_ip=$(get_node_ip "${nodes[1]}")
 
     # 定义要测试的源 Pod 列表
     # 改进: spider/dual 同时覆盖 *-1 和 *-2 两个节点的源
@@ -1112,12 +1157,18 @@ run_pod_to_svc_tests() {
         test_pod_to_svc "$src" "svc-clusterip.${NAMESPACE}.svc.cluster.local:80" \
             "[${label}] → ClusterIP (DNS: svc-clusterip)" "clusterip-dns"
 
-        # NodePort
+        # NodePort (node1 = http-server 所在节点)
         if [[ -n "$nodeport" && -n "$node_ip" ]]; then
             test_pod_to_svc "$src" "${node_ip}:${nodeport}" \
                 "[${label}] → NodePort (${node_ip}:${nodeport})" "nodeport"
         else
             record_result skip "[${label}] → NodePort (无法获取 NodePort)"
+        fi
+
+        # NodePort 经无后端节点 (kube-proxy 跨节点转发, VXLAN offload 等问题的典型暴露点)
+        if [[ -n "$nodeport" && -n "$node2_ip" ]]; then
+            test_pod_to_svc "$src" "${node2_ip}:${nodeport}" \
+                "[${label}] → NodePort 无后端节点 (${node2_ip}:${nodeport})" "nodeport-remote"
         fi
 
         # LoadBalancer
@@ -1397,9 +1448,19 @@ spec:
   - Ingress
   ingress: []
 EOF
-    sleep 3
 
-    if ! exec_in_pod "$src" curl -fsS --connect-timeout 5 "http://${dst_ip}:${port}" &>/dev/null; then
+    # 轮询等待策略下发 (慢 CNI 上固定 sleep 3 会误报"未生效")
+    local enforced=false
+    local np_deadline=$((SECONDS + 15))
+    while [[ $SECONDS -lt $np_deadline ]]; do
+        if ! exec_in_pod "$src" curl -fsS --connect-timeout 3 "http://${dst_ip}:${port}" &>/dev/null; then
+            enforced=true
+            break
+        fi
+        sleep 2
+    done
+
+    if [[ "$enforced" == "true" ]]; then
         record_result pass "[${label}] NetworkPolicy deny-all 生效: TCP 被拒绝"
     else
         record_result fail "[${label}] NetworkPolicy deny-all 未生效: TCP 仍成功 (CNI 可能不支持)"
@@ -1410,9 +1471,19 @@ EOF
     fi
 
     kc delete networkpolicy -n "$NAMESPACE" "deny-all-${target}" --ignore-not-found &>/dev/null
-    sleep 3
 
-    if exec_in_pod "$src" curl -fsS --connect-timeout 5 "http://${dst_ip}:${port}" &>/dev/null; then
+    # 同样轮询等待策略撤销生效
+    local recovered=false
+    np_deadline=$((SECONDS + 15))
+    while [[ $SECONDS -lt $np_deadline ]]; do
+        if exec_in_pod "$src" curl -fsS --connect-timeout 3 "http://${dst_ip}:${port}" &>/dev/null; then
+            recovered=true
+            break
+        fi
+        sleep 2
+    done
+
+    if [[ "$recovered" == "true" ]]; then
         record_result pass "[${label}] NetworkPolicy 删除后恢复: TCP 成功"
     else
         record_result fail "[${label}] NetworkPolicy 删除后未恢复: TCP 仍失败"
